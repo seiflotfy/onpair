@@ -1,0 +1,4 @@
+github.com/axiomhq/fsst v0.0.1 h1:84oULGLR3yQ/PtWAsP4D0Xy1m9yACMtc7ZOwL2o/+2E=
+github.com/axiomhq/fsst v0.0.1/go.mod h1:tEvRV7neiydveIx4KFKJXc+ovTSLISk4q8GzQmQVMAI=
+github.com/cespare/xxhash/v2 v2.2.0 h1:DC2CZ1Ep5Y4k3ZQ899DldepgrayRUGE6BBZ/cd9Cj44=
+github.com/cespare/xxhash/v2 v2.2.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
