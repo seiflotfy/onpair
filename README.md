@@ -3,7 +3,7 @@
 [![Paper](https://img.shields.io/badge/Paper-arXiv:2508.02280-blue)](https://arxiv.org/abs/2508.02280)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Rust implementation of **OnPair**, a compression algorithm designed for efficient random access on sequences of short strings.
+Go implementation of **OnPair**, a compression algorithm designed for efficient random access on sequences of short strings.
 
 ## Overview
 
@@ -16,55 +16,174 @@ OnPair16 is a variant that limits dictionary entries to a maximum length of 16 b
 
 ## Installation
 
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-onpair_rs = { git = "https://github.com/gargiulofrancesco/onpair_rs" }
+```bash
+go get github.com/seiflotfy/onpair
 ```
 
 ## Quick Start
 
-```rust
-use onpair_rs::{OnPair, OnPair16};
+### Reusable model (`TrainModel` -> `Encode`)
 
-fn main() {
-    // Your string data
-    let strings = vec![
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/seiflotfy/onpair"
+)
+
+func main() {
+    trainRows := []string{
         "user_000001",
-        "user_000002", 
+        "user_000002",
         "user_000003",
         "admin_001",
         "user_000004",
-    ];
+    }
 
-    let mut compressor = OnPair::new();
-    
-    // Compress all strings
-    compressor.compress_strings(&strings);
-    
-    // Random access decompression
-    let mut buffer = vec![0u8; 256];
-    
-    for i in 0..strings.len() {
-        let size = compressor.decompress_string(i, &mut buffer);
-        let decompressed = std::str::from_utf8(&buffer[..size]).unwrap();
-        println!("String {}: {}", i, decompressed);
+    model, err := onpair.TrainModel(trainRows, onpair.WithMaxTokenLength(16))
+    if err != nil {
+        panic(err)
+    }
+
+    archive, err := model.Encode(trainRows)
+    if err != nil {
+        panic(err)
+    }
+
+    for i := 0; i < archive.Rows(); i++ {
+        row, err := archive.AppendRow(nil, i)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("row %d: %s\n", i, string(row))
     }
 }
 ```
 
+### Single-shot encode (`Encoder`)
+
+```go
+enc := onpair.NewEncoder(
+    onpair.WithMaxTokenLength(16), // optional
+    onpair.WithMaxTokenID(4095),   // optional smaller dictionary cap
+)
+archive, err := enc.Encode([]string{"user_001", "user_002", "admin_001"})
+if err != nil {
+    panic(err)
+}
+```
+
+## Advanced Features
+
+### Random access (decode one string at a time)
+
+```go
+row, err := archive.AppendRow(nil, 42) // row index 42 only
+if err != nil {
+    panic(err)
+}
+fmt.Println(string(row))
+```
+
+### Strict decoding into caller buffers
+
+```go
+buf := make([]byte, 256)
+n, err := archive.DecompressString(0, buf) // returns ErrShortBuffer if too small
+if err != nil {
+    panic(err)
+}
+fmt.Println(string(buf[:n]))
+```
+
+### Bulk decode with error handling
+
+```go
+all := make([]byte, 4096)
+n, err := archive.DecompressAllChecked(all)
+if err != nil {
+    panic(err)
+}
+_ = all[:n]
+```
+
+### Serialization
+
+```go
+file, err := os.Create("archive.bin")
+if err != nil {
+    panic(err)
+}
+defer file.Close()
+
+if _, err := archive.WriteTo(file); err != nil {
+    panic(err)
+}
+
+loaded := &onpair.Archive{}
+if _, err := file.Seek(0, io.SeekStart); err != nil {
+    panic(err)
+}
+if _, err := loaded.ReadFrom(file); err != nil {
+    panic(err)
+}
+```
+
+## API Reference
+
+### Recommended lifecycle (`Model` + `Archive`)
+
+```go
+model, err := onpair.TrainModel(trainRows, onpair.WithMaxTokenLength(16))
+if err != nil { /* ... */ }
+
+archive, err := model.Encode(queryRows)
+if err != nil { /* ... */ }
+
+out, err := archive.AppendRow(nil, 0)
+if err != nil { /* ... */ }
+_ = out
+```
+
+### Constructors and options
+
+- `NewEncoder(opts ...Option) *Encoder`
+- `NewModel(opts ...Option) *Model`
+- `TrainModel(strings []string, opts ...Option) (*Model, error)`
+- `WithThreshold(t uint16) Option`
+- `WithMaxTokenLength(n int) Option`
+- `WithMaxTokenID(maxID uint16) Option`
+
+### Encode/decode
+
+- `(*Encoder).Encode(strings []string) (*Archive, error)` (single-shot train+encode)
+- `(*Model).Train(strings []string) error`
+- `(*Model).Encode(strings []string) (*Archive, error)`
+- `(*Model).Trained() bool`
+- `(*Archive).Rows() int`
+- `(*Archive).DecodedLen(index int) (int, error)`
+- `(*Archive).AppendRow(dst []byte, index int) ([]byte, error)`
+- `(*Archive).AppendAll(dst []byte) ([]byte, error)`
+- `(*Archive).DecompressString(index int, buffer []byte) (int, error)`
+- `(*Archive).DecompressAllChecked(buffer []byte) (int, error)`
+
+### Serialization
+
+- `(*Archive).WriteTo(w io.Writer) (int64, error)`
+- `(*Archive).ReadFrom(r io.Reader) (int64, error)`
+
 ## Building from Source
 
 ```bash
-git clone https://github.com/gargiulofrancesco/onpair_rs
-cd onpair_rs
+git clone https://github.com/seiflotfy/onpair
+cd onpair
 
-# Build with optimizations
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+# Run tests
+go test ./...
 
-# Run the example
-RUSTFLAGS="-C target-cpu=native" cargo run --example basic_usage --release
+# Run benchmarks
+go test -bench=. ./...
 ```
 
 ## License

@@ -1,7 +1,8 @@
-module github.com/seif/onpair
+module github.com/seiflotfy/onpair
 
 go 1.24.5
 
-require github.com/cespare/xxhash/v2 v2.2.0
-
-require github.com/axiomhq/fsst v0.0.1 // indirect
+require (
+	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/jaeyo/go-drain3 v0.1.2 // indirect
+)
