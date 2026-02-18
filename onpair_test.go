@@ -387,6 +387,42 @@ func TestWithMaxTokenID255DisablesMerges(t *testing.T) {
 	}
 }
 
+func TestResolveTokenLimitWithTokenBitWidth12(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want uint16
+	}{
+		{
+			name: "default max clipped for 12-bit",
+			cfg:  Config{TokenBitWidth: tokenBitWidth12},
+			want: maxTokenID12Bit,
+		},
+		{
+			name: "explicit large max clipped for 12-bit",
+			cfg:  Config{TokenBitWidth: tokenBitWidth12, MaxTokenID: 5000},
+			want: maxTokenID12Bit,
+		},
+		{
+			name: "explicit small max preserved",
+			cfg:  Config{TokenBitWidth: tokenBitWidth12, MaxTokenID: 600},
+			want: 600,
+		},
+		{
+			name: "invalid width falls back to 16-bit",
+			cfg:  Config{TokenBitWidth: 7},
+			want: maxTokenID,
+		},
+	}
+
+	for _, tc := range tests {
+		got := resolveTokenLimit(tc.cfg)
+		if got != tc.want {
+			t.Fatalf("%s: got %d want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestOnPair16MatcherBucketBound(t *testing.T) {
 	m := newMatcher(16)
 	prefix := []byte("abcdefgh")
@@ -1138,6 +1174,116 @@ func TestSerialization16(t *testing.T) {
 		if decompressed != strings[i] {
 			t.Errorf("Decompression mismatch at index %d: got %q, want %q", i, decompressed, strings[i])
 		}
+	}
+}
+
+func TestSerializationPacked12Bit(t *testing.T) {
+	input := []string{
+		"user_000001",
+		"user_000002",
+		"user_000003",
+		"admin_001",
+		"user_000004",
+	}
+
+	archive := mustEncode(NewEncoder(WithTokenBitWidth(12)), input)
+	if archive.tokenBitWidth() != tokenBitWidth12 {
+		t.Fatalf("token bit-width mismatch: got %d want %d", archive.tokenBitWidth(), tokenBitWidth12)
+	}
+
+	expectedCompressedBytes := packed12ByteSize(len(archive.CompressedData))
+	expectedSpaceUsed := expectedCompressedBytes + len(archive.Dictionary) + len(archive.TokenBoundaries)*4
+	if got := archive.SpaceUsed(); got != expectedSpaceUsed {
+		t.Fatalf("SpaceUsed mismatch: got %d want %d", got, expectedSpaceUsed)
+	}
+
+	var buf bytes.Buffer
+	if _, err := archive.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	r := bytes.NewReader(buf.Bytes())
+	var magic [4]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		t.Fatalf("read magic failed: %v", err)
+	}
+	if string(magic[:]) != archiveMagic {
+		t.Fatalf("magic mismatch: got %q want %q", string(magic[:]), archiveMagic)
+	}
+
+	var version uint16
+	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
+		t.Fatalf("read version failed: %v", err)
+	}
+	if version != archiveVersion {
+		t.Fatalf("version mismatch: got %d want %d", version, archiveVersion)
+	}
+
+	var stageCount uint16
+	if err := binary.Read(r, binary.LittleEndian, &stageCount); err != nil {
+		t.Fatalf("read stage count failed: %v", err)
+	}
+
+	foundCompressed := false
+	for i := 0; i < int(stageCount); i++ {
+		header, _, err := readStageHeader(r)
+		if err != nil {
+			t.Fatalf("readStageHeader(%d) failed: %v", i, err)
+		}
+		params := make([]byte, header.paramLen)
+		if _, err := io.ReadFull(r, params); err != nil {
+			t.Fatalf("read params(%d) failed: %v", i, err)
+		}
+
+		if header.name == stageCompressedData {
+			foundCompressed = true
+			if len(params) != 1 || params[0] != stageCompressedDataParamWidth12 {
+				t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth12)
+			}
+			expectedPayloadLen := uint32(4 + expectedCompressedBytes)
+			if header.dataLen != expectedPayloadLen {
+				t.Fatalf("compressed_data payload length mismatch: got %d want %d", header.dataLen, expectedPayloadLen)
+			}
+		}
+
+		if _, err := io.CopyN(io.Discard, r, int64(header.dataLen)); err != nil {
+			t.Fatalf("skip payload(%d) failed: %v", i, err)
+		}
+	}
+	if !foundCompressed {
+		t.Fatalf("compressed_data stage not found")
+	}
+
+	loaded := &Archive{}
+	if _, err := loaded.ReadFrom(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+	if loaded.tokenBitWidth() != tokenBitWidth12 {
+		t.Fatalf("loaded token bit-width mismatch: got %d want %d", loaded.tokenBitWidth(), tokenBitWidth12)
+	}
+	if !slices.Equal(loaded.CompressedData, archive.CompressedData) {
+		t.Fatalf("compressed data mismatch after round-trip")
+	}
+}
+
+func TestSerializationPacked12BitRejectsOutOfRangeToken(t *testing.T) {
+	tokenID := uint16(maxTokenID12Bit + 1)
+	tokenBoundaries := make([]uint32, int(tokenID)+2)
+	dictionary := make([]byte, int(tokenID)+1)
+	for i := range tokenBoundaries {
+		tokenBoundaries[i] = uint32(i)
+	}
+
+	archive := &Archive{
+		CompressedData:          []uint16{tokenID},
+		StringBoundaries:        []int{0, 1},
+		Dictionary:              dictionary,
+		TokenBoundaries:         tokenBoundaries,
+		compressedTokenBitWidth: tokenBitWidth12,
+	}
+
+	if _, err := archive.WriteTo(io.Discard); err == nil {
+		t.Fatalf("expected WriteTo to fail for out-of-range 12-bit token")
 	}
 }
 
@@ -2413,6 +2559,7 @@ func FuzzArchiveRoundTrip(f *testing.F) {
 			{name: "default"},
 			{name: "maxlen16", opts: []Option{WithMaxTokenLength(16)}},
 			{name: "maxid4095", opts: []Option{WithMaxTokenID(4095)}},
+			{name: "bitwidth12", opts: []Option{WithTokenBitWidth(12)}},
 		}
 
 		for _, tc := range cases {

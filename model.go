@@ -49,10 +49,11 @@ func (m *Model) Encode(strings []string) (*Archive, error) {
 	dict := append([]byte(nil), m.dictionary...)
 	tokenBoundaries := append([]uint32(nil), m.tokenBoundaries...)
 	return &Archive{
-		CompressedData:   compressedData,
-		StringBoundaries: stringBoundaries,
-		Dictionary:       dict,
-		TokenBoundaries:  tokenBoundaries,
+		CompressedData:          compressedData,
+		StringBoundaries:        stringBoundaries,
+		Dictionary:              dict,
+		TokenBoundaries:         tokenBoundaries,
+		compressedTokenBitWidth: resolveTokenBitWidth(enc.config),
 	}, nil
 }
 
@@ -72,9 +73,10 @@ func (e *Encoder) Encode(strings []string) (*Archive, error) {
 	compressedData, stringBoundaries := e.compress(data, endPositions, matcher)
 
 	return &Archive{
-		CompressedData:   compressedData,
-		StringBoundaries: stringBoundaries,
-		Dictionary:       dict,
-		TokenBoundaries:  tokenBoundaries,
+		CompressedData:          compressedData,
+		StringBoundaries:        stringBoundaries,
+		Dictionary:              dict,
+		TokenBoundaries:         tokenBoundaries,
+		compressedTokenBitWidth: resolveTokenBitWidth(e.config),
 	}, nil
 }

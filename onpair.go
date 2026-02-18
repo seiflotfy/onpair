@@ -8,13 +8,17 @@ import (
 const (
 	singleByteTokens = 256   // singleByteTokens is the number of single-byte tokens (0-255)
 	maxTokenID       = 65535 // maxTokenID is the maximum token ID (uint16 max)
+	maxTokenID12Bit  = 4095  // maxTokenID12Bit is the maximum token ID representable in 12 bits.
+	tokenBitWidth12  = uint8(12)
+	tokenBitWidth16  = uint8(16)
 )
 
 // Config holds configuration for the compressor.
 type Config struct {
-	Threshold   uint16 // Minimum frequency to merge tokens (0 = dynamic)
-	MaxTokenID  uint16 // Maximum token ID (0 = default, max 65535)
-	MaxTokenLen int    // Maximum token length (0 = unlimited)
+	Threshold     uint16 // Minimum frequency to merge tokens (0 = dynamic)
+	MaxTokenID    uint16 // Maximum token ID (0 = default, max 65535)
+	MaxTokenLen   int    // Maximum token length (0 = unlimited)
+	TokenBitWidth uint8  // Encoded token bit-width for archives (0 = default 16, supported: 12 or 16)
 }
 
 // Option is a functional option for configuring the compressor.
@@ -40,6 +44,15 @@ func WithMaxTokenID(maxID uint16) Option {
 func WithMaxTokenLength(n int) Option {
 	return func(c *Config) {
 		c.MaxTokenLen = n
+	}
+}
+
+// WithTokenBitWidth configures the encoded token bit-width used in archive
+// storage calculations and serialization. Supported values: 12 or 16.
+// Any other value falls back to 16.
+func WithTokenBitWidth(bits uint8) Option {
+	return func(c *Config) {
+		c.TokenBitWidth = bits
 	}
 }
 
@@ -139,16 +152,32 @@ func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []ui
 }
 
 func resolveTokenLimit(cfg Config) uint16 {
+	limit := uint16(maxTokenID)
 	if cfg.MaxTokenID != 0 {
 		if cfg.MaxTokenID < uint16(singleByteTokens-1) {
-			return uint16(singleByteTokens - 1)
+			limit = uint16(singleByteTokens - 1)
+		} else if cfg.MaxTokenID > maxTokenID {
+			limit = maxTokenID
+		} else {
+			limit = cfg.MaxTokenID
 		}
-		if cfg.MaxTokenID > maxTokenID {
-			return maxTokenID
-		}
-		return cfg.MaxTokenID
 	}
-	return maxTokenID
+
+	if resolveTokenBitWidth(cfg) == tokenBitWidth12 && limit > maxTokenID12Bit {
+		limit = maxTokenID12Bit
+	}
+	return limit
+}
+
+func resolveTokenBitWidth(cfg Config) uint8 {
+	switch cfg.TokenBitWidth {
+	case tokenBitWidth12:
+		return tokenBitWidth12
+	case tokenBitWidth16:
+		return tokenBitWidth16
+	default:
+		return tokenBitWidth16
+	}
 }
 
 // buildTokens discovers and creates merged tokens from the training data.
