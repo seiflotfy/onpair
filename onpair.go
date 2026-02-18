@@ -1,8 +1,10 @@
 package onpair
 
 import (
+	"bytes"
 	"errors"
 	"math"
+	"sort"
 )
 
 const (
@@ -15,10 +17,13 @@ const (
 
 // Config holds configuration for the compressor.
 type Config struct {
-	Threshold     uint16 // Minimum frequency to merge tokens (0 = dynamic)
-	MaxTokenID    uint16 // Maximum token ID (0 = default, max 65535)
-	MaxTokenLen   int    // Maximum token length (0 = unlimited)
-	TokenBitWidth uint8  // Encoded token bit-width for archives (0 = default 16, supported: 12 or 16)
+	Threshold           uint16 // Minimum frequency to merge tokens (0 = dynamic)
+	MaxTokenID          uint16 // Maximum token ID (0 = default, max 65535)
+	MaxTokenLen         int    // Maximum token length (0 = unlimited)
+	TokenBitWidth       uint8  // Encoded token bit-width for archives (0 = default 16, supported: 12 or 16)
+	TrainingSampleBytes int    // Maximum sampled training bytes (0 = default 1 MiB)
+	DrainStratified     bool   // Enable Drain-like stratified sampling for training.
+	DrainMaxClusters    int    // Maximum number of Drain-like clusters for stratified sampling.
 }
 
 // Option is a functional option for configuring the compressor.
@@ -56,6 +61,24 @@ func WithTokenBitWidth(bits uint8) Option {
 	}
 }
 
+// WithTrainingSampleBytes sets the maximum number of sampled bytes used to
+// train the dictionary. Non-positive values fall back to the default.
+func WithTrainingSampleBytes(n int) Option {
+	return func(c *Config) {
+		c.TrainingSampleBytes = n
+	}
+}
+
+// WithDrainStratifiedSampling enables Drain-like stratified sampling when
+// selecting rows used for dictionary training.
+// maxClusters <= 0 uses the default cluster cap.
+func WithDrainStratifiedSampling(maxClusters int) Option {
+	return func(c *Config) {
+		c.DrainStratified = true
+		c.DrainMaxClusters = maxClusters
+	}
+}
+
 // Encoder trains the dictionary and compresses data.
 type Encoder struct {
 	config Config
@@ -80,6 +103,12 @@ func NewEncoder(opts ...Option) *Encoder {
 // train populates the dictionary based on the input data.
 // Maximum sample size for training (in bytes) - larger data uses sampling
 const maxTrainingSampleBytes = 1024 * 1024 // 1MB
+
+const (
+	defaultDrainMaxClusters    = 2048
+	defaultDrainTemplateTokens = 12
+	drainOtherClusterKey       = "__drain_other__"
+)
 
 func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []uint32) {
 	tokenBoundaries := make([]uint32, 0, singleByteTokens+4096)
@@ -115,19 +144,18 @@ func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []ui
 		shuffledIndices[i], shuffledIndices[j] = shuffledIndices[j], shuffledIndices[i]
 	}
 
-	// Sample if data is large - use first N shuffled strings up to 1MB
+	// Sample if data is large - use first N shuffled strings up to the configured sample size.
 	sampleIndices := shuffledIndices
 	sampleBytes := len(data)
-	if len(data) > maxTrainingSampleBytes {
-		sampleSize := 0
-		for i, idx := range shuffledIndices {
-			strLen := endPositions[idx+1] - endPositions[idx]
-			sampleSize += strLen
-			if sampleSize >= maxTrainingSampleBytes {
-				sampleIndices = shuffledIndices[:i+1]
-				sampleBytes = sampleSize
-				break
-			}
+	trainingSampleBytes := resolveTrainingSampleBytes(e.config)
+	if len(data) > trainingSampleBytes {
+		if e.config.DrainStratified {
+			maxClusters := resolveDrainMaxClusters(e.config)
+			sampleIndices, sampleBytes = stratifiedSampleIndicesByDrainLike(
+				data, endPositions, shuffledIndices, trainingSampleBytes, maxClusters,
+			)
+		} else {
+			sampleIndices, sampleBytes = sampleIndicesByBytes(shuffledIndices, endPositions, trainingSampleBytes)
 		}
 	}
 
@@ -178,6 +206,358 @@ func resolveTokenBitWidth(cfg Config) uint8 {
 	default:
 		return tokenBitWidth16
 	}
+}
+
+func resolveTrainingSampleBytes(cfg Config) int {
+	if cfg.TrainingSampleBytes > 0 {
+		return cfg.TrainingSampleBytes
+	}
+	return maxTrainingSampleBytes
+}
+
+func resolveDrainMaxClusters(cfg Config) int {
+	if cfg.DrainMaxClusters > 0 {
+		return cfg.DrainMaxClusters
+	}
+	return defaultDrainMaxClusters
+}
+
+func sampleIndicesByBytes(shuffledIndices []int, endPositions []int, sampleLimit int) ([]int, int) {
+	if sampleLimit <= 0 || len(shuffledIndices) == 0 {
+		return shuffledIndices, 0
+	}
+
+	sampleSize := 0
+	for i, idx := range shuffledIndices {
+		strLen := endPositions[idx+1] - endPositions[idx]
+		sampleSize += strLen
+		if sampleSize >= sampleLimit {
+			return shuffledIndices[:i+1], sampleSize
+		}
+	}
+	return shuffledIndices, sampleSize
+}
+
+func stratifiedSampleIndicesByDrainLike(
+	data []byte,
+	endPositions []int,
+	shuffledIndices []int,
+	sampleBytesLimit int,
+	maxClusters int,
+) ([]int, int) {
+	if sampleBytesLimit <= 0 || len(shuffledIndices) == 0 {
+		return shuffledIndices, 0
+	}
+
+	clusterGroups := make(map[string][]int, 256)
+	clusterOrder := make([]string, 0, 256)
+	totalPoolBytes := 0
+
+	for _, idx := range shuffledIndices {
+		start := endPositions[idx]
+		end := endPositions[idx+1]
+		totalPoolBytes += end - start
+		key := drainLikeTemplateKey(data[start:end], defaultDrainTemplateTokens)
+
+		if _, exists := clusterGroups[key]; !exists {
+			if maxClusters > 0 && len(clusterGroups) >= maxClusters {
+				key = drainOtherClusterKey
+				if _, hasOther := clusterGroups[key]; !hasOther {
+					clusterGroups[key] = nil
+					clusterOrder = append(clusterOrder, key)
+				}
+			} else {
+				clusterGroups[key] = nil
+				clusterOrder = append(clusterOrder, key)
+			}
+		}
+		clusterGroups[key] = append(clusterGroups[key], idx)
+	}
+
+	if len(clusterOrder) == 0 {
+		return sampleIndicesByBytes(shuffledIndices, endPositions, sampleBytesLimit)
+	}
+
+	totalRows := len(shuffledIndices)
+	avgLen := float64(totalPoolBytes) / float64(totalRows)
+	targetRows := int(float64(sampleBytesLimit) / avgLen)
+	if targetRows < 1 {
+		targetRows = 1
+	}
+	if targetRows > totalRows {
+		targetRows = totalRows
+	}
+
+	type clusterQuota struct {
+		key       string
+		quota     int
+		remainder float64
+	}
+	quotas := make([]clusterQuota, 0, len(clusterOrder))
+	allocated := 0
+	for _, key := range clusterOrder {
+		count := len(clusterGroups[key])
+		exact := float64(count) * float64(targetRows) / float64(totalRows)
+		quota := int(exact)
+		quotas = append(quotas, clusterQuota{
+			key:       key,
+			quota:     quota,
+			remainder: exact - float64(quota),
+		})
+		allocated += quota
+	}
+	if allocated < targetRows {
+		sort.SliceStable(quotas, func(i, j int) bool {
+			return quotas[i].remainder > quotas[j].remainder
+		})
+		remaining := targetRows - allocated
+		for i := 0; remaining > 0; i++ {
+			idx := i % len(quotas)
+			quotas[idx].quota++
+			remaining--
+		}
+	}
+
+	clusterPos := make(map[string]int, len(quotas))
+	sampleIndices := make([]int, 0, targetRows)
+	sampleBytes := 0
+
+	for _, q := range quotas {
+		group := clusterGroups[q.key]
+		n := q.quota
+		if n > len(group) {
+			n = len(group)
+		}
+		if n <= 0 {
+			continue
+		}
+		for i := 0; i < n; i++ {
+			idx := group[i]
+			sampleIndices = append(sampleIndices, idx)
+			sampleBytes += endPositions[idx+1] - endPositions[idx]
+		}
+		clusterPos[q.key] = n
+		if sampleBytes >= sampleBytesLimit {
+			return sampleIndices, sampleBytes
+		}
+	}
+
+	// Top up in round-robin order when byte budget isn't reached due row-length variance.
+	orderedKeys := make([]string, 0, len(quotas))
+	for _, q := range quotas {
+		orderedKeys = append(orderedKeys, q.key)
+	}
+	for sampleBytes < sampleBytesLimit {
+		progressed := false
+		for _, key := range orderedKeys {
+			group := clusterGroups[key]
+			pos := clusterPos[key]
+			if pos >= len(group) {
+				continue
+			}
+
+			idx := group[pos]
+			clusterPos[key] = pos + 1
+			sampleIndices = append(sampleIndices, idx)
+			sampleBytes += endPositions[idx+1] - endPositions[idx]
+			progressed = true
+
+			if sampleBytes >= sampleBytesLimit {
+				break
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+
+	if len(sampleIndices) == 0 {
+		return sampleIndicesByBytes(shuffledIndices, endPositions, sampleBytesLimit)
+	}
+	return sampleIndices, sampleBytes
+}
+
+func drainLikeTemplateKey(line []byte, maxTokens int) string {
+	if len(line) == 0 {
+		return ""
+	}
+	fields := bytes.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	if maxTokens > 0 && len(fields) > maxTokens {
+		fields = fields[:maxTokens]
+	}
+
+	key := make([]byte, 0, len(line))
+	for i, field := range fields {
+		if i > 0 {
+			key = append(key, ' ')
+		}
+		key = appendDrainNormalizedToken(key, field)
+	}
+	return string(key)
+}
+
+func appendDrainNormalizedToken(dst []byte, token []byte) []byte {
+	trimmed := trimDrainToken(token)
+	if len(trimmed) == 0 {
+		return append(dst, "<*>"...)
+	}
+	if eq := bytes.IndexByte(trimmed, '='); eq > 0 && eq < len(trimmed)-1 {
+		for _, b := range trimmed[:eq+1] {
+			dst = append(dst, toLowerASCII(b))
+		}
+		return appendDrainNormalizedValue(dst, trimmed[eq+1:])
+	}
+	return appendDrainNormalizedValue(dst, trimmed)
+}
+
+func appendDrainNormalizedValue(dst []byte, token []byte) []byte {
+	if len(token) == 0 {
+		return append(dst, "<*>"...)
+	}
+	if looksIPv4Token(token) {
+		return append(dst, "<IP>"...)
+	}
+	if looksUUIDToken(token) {
+		return append(dst, "<UUID>"...)
+	}
+	if looksHexToken(token) {
+		return append(dst, "<HEX>"...)
+	}
+	if looksNumberLikeToken(token) {
+		return append(dst, "<NUM>"...)
+	}
+
+	limit := len(token)
+	if limit > 32 {
+		limit = 32
+	}
+	for _, b := range token[:limit] {
+		dst = append(dst, toLowerASCII(b))
+	}
+	return dst
+}
+
+func trimDrainToken(token []byte) []byte {
+	start, end := 0, len(token)
+	for start < end && isDrainTrimPunct(token[start]) {
+		start++
+	}
+	for end > start && isDrainTrimPunct(token[end-1]) {
+		end--
+	}
+	return token[start:end]
+}
+
+func isDrainTrimPunct(b byte) bool {
+	switch b {
+	case '[', ']', '(', ')', '{', '}', '<', '>', ',', ';', ':', '\'', '"':
+		return true
+	default:
+		return false
+	}
+}
+
+func toLowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func looksNumberLikeToken(token []byte) bool {
+	digits := 0
+	for _, b := range token {
+		if b >= '0' && b <= '9' {
+			digits++
+			continue
+		}
+		switch b {
+		case '.', ',', '-', '_', ':', '/', '+':
+			continue
+		default:
+			return false
+		}
+	}
+	if digits == 0 {
+		return false
+	}
+	return digits*2 >= len(token)
+}
+
+func looksHexToken(token []byte) bool {
+	if len(token) < 8 {
+		return false
+	}
+	hexCount := 0
+	for _, b := range token {
+		if (b >= '0' && b <= '9') ||
+			(b >= 'a' && b <= 'f') ||
+			(b >= 'A' && b <= 'F') {
+			hexCount++
+			continue
+		}
+		if b == '-' {
+			continue
+		}
+		return false
+	}
+	return hexCount >= 8
+}
+
+func looksUUIDToken(token []byte) bool {
+	if len(token) != 36 {
+		return false
+	}
+	for i, b := range token {
+		switch i {
+		case 8, 13, 18, 23:
+			if b != '-' {
+				return false
+			}
+		default:
+			if !((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func looksIPv4Token(token []byte) bool {
+	parts := 0
+	value := 0
+	digits := 0
+	for i, b := range token {
+		if b >= '0' && b <= '9' {
+			value = value*10 + int(b-'0')
+			digits++
+			if value > 255 {
+				return false
+			}
+			continue
+		}
+
+		if b != '.' {
+			return false
+		}
+		if digits == 0 {
+			return false
+		}
+		parts++
+		if parts > 3 {
+			return false
+		}
+		value = 0
+		digits = 0
+
+		if i == len(token)-1 {
+			return false
+		}
+	}
+	return parts == 3 && digits > 0
 }
 
 // buildTokens discovers and creates merged tokens from the training data.

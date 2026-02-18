@@ -68,6 +68,8 @@ enc := onpair.NewEncoder(
     onpair.WithMaxTokenLength(16), // optional
     onpair.WithMaxTokenID(4095),   // optional smaller dictionary cap
     onpair.WithTokenBitWidth(12),  // optional packed 12-bit token stream
+    onpair.WithTrainingSampleBytes(8*1024*1024), // optional larger training sample
+    onpair.WithDrainStratifiedSampling(2048),    // optional Drain-like stratified sampling
 )
 archive, err := enc.Encode([]string{"user_001", "user_002", "admin_001"})
 if err != nil {
@@ -159,6 +161,8 @@ _ = out
 - `WithMaxTokenLength(n int) Option`
 - `WithMaxTokenID(maxID uint16) Option`
 - `WithTokenBitWidth(bits uint8) Option` (`12` or `16`, default `16`)
+- `WithTrainingSampleBytes(n int) Option` (default `1 MiB`)
+- `WithDrainStratifiedSampling(maxClusters int) Option`
 
 ### Encode/decode
 

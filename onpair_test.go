@@ -423,6 +423,72 @@ func TestResolveTokenLimitWithTokenBitWidth12(t *testing.T) {
 	}
 }
 
+func TestResolveTrainingSampleBytes(t *testing.T) {
+	if got := resolveTrainingSampleBytes(Config{}); got != maxTrainingSampleBytes {
+		t.Fatalf("default training sample bytes: got %d want %d", got, maxTrainingSampleBytes)
+	}
+	if got := resolveTrainingSampleBytes(Config{TrainingSampleBytes: 64 * 1024}); got != 64*1024 {
+		t.Fatalf("custom training sample bytes: got %d want %d", got, 64*1024)
+	}
+}
+
+func TestResolveDrainMaxClusters(t *testing.T) {
+	if got := resolveDrainMaxClusters(Config{}); got != defaultDrainMaxClusters {
+		t.Fatalf("default drain max clusters: got %d want %d", got, defaultDrainMaxClusters)
+	}
+	if got := resolveDrainMaxClusters(Config{DrainMaxClusters: 32}); got != 32 {
+		t.Fatalf("custom drain max clusters: got %d want %d", got, 32)
+	}
+}
+
+func TestDrainLikeTemplateKeyNormalizesDynamicTokens(t *testing.T) {
+	line := []byte(`[2025-09-12T12:00:00Z] INFO client=10.1.2.3 req=550e8400-e29b-41d4-a716-446655440000 status=500`)
+	key := drainLikeTemplateKey(line, 16)
+
+	if !strings.Contains(key, "<IP>") {
+		t.Fatalf("expected key to contain <IP>, got %q", key)
+	}
+	if !strings.Contains(key, "<UUID>") {
+		t.Fatalf("expected key to contain <UUID>, got %q", key)
+	}
+	if !strings.Contains(key, "<NUM>") {
+		t.Fatalf("expected key to contain <NUM>, got %q", key)
+	}
+}
+
+func TestStratifiedSampleIndicesByDrainLike(t *testing.T) {
+	rows := []string{
+		"INFO service=a status=200 dur=10",
+		"INFO service=a status=200 dur=11",
+		"INFO service=a status=500 dur=12",
+		"WARN service=b timeout=1234 host=10.2.3.4",
+		"WARN service=b timeout=1500 host=10.2.3.5",
+		"WARN service=b timeout=2000 host=10.2.3.6",
+	}
+	data, endPositions := flattenStrings(rows)
+	shuffled := []int{0, 1, 2, 3, 4, 5}
+	sampleLimit := len(rows[0]) + len(rows[3])
+
+	sample, sampleBytes := stratifiedSampleIndicesByDrainLike(data, endPositions, shuffled, sampleLimit, 8)
+	if len(sample) == 0 || sampleBytes == 0 {
+		t.Fatalf("expected non-empty sample")
+	}
+
+	seenA := false
+	seenB := false
+	for _, idx := range sample {
+		if idx <= 2 {
+			seenA = true
+		}
+		if idx >= 3 {
+			seenB = true
+		}
+	}
+	if !seenA || !seenB {
+		t.Fatalf("expected sample to include both clusters, got %v", sample)
+	}
+}
+
 func TestOnPair16MatcherBucketBound(t *testing.T) {
 	m := newMatcher(16)
 	prefix := []byte("abcdefgh")
