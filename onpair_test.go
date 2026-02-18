@@ -1303,12 +1303,17 @@ func TestSerializationPacked12Bit(t *testing.T) {
 
 		if header.name == stageCompressedData {
 			foundCompressed = true
-			if len(params) != 1 || params[0] != stageCompressedDataParamWidth12 {
-				t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth12)
+			if len(params) != 1 {
+				t.Fatalf("compressed_data params length mismatch: got %d want 1", len(params))
 			}
-			expectedPayloadLen := uint32(4 + expectedCompressedBytes)
-			if header.dataLen != expectedPayloadLen {
-				t.Fatalf("compressed_data payload length mismatch: got %d want %d", header.dataLen, expectedPayloadLen)
+			if params[0] != stageCompressedDataParamWidth12 && params[0] != stageCompressedDataParamWidth12Flate {
+				t.Fatalf("compressed_data params mismatch: got %v want [%d or %d]", params, stageCompressedDataParamWidth12, stageCompressedDataParamWidth12Flate)
+			}
+			if params[0] == stageCompressedDataParamWidth12 {
+				expectedPayloadLen := uint32(4 + expectedCompressedBytes)
+				if header.dataLen != expectedPayloadLen {
+					t.Fatalf("compressed_data payload length mismatch: got %d want %d", header.dataLen, expectedPayloadLen)
+				}
 			}
 		}
 
@@ -1329,6 +1334,154 @@ func TestSerializationPacked12Bit(t *testing.T) {
 	}
 	if !slices.Equal(loaded.CompressedData, archive.CompressedData) {
 		t.Fatalf("compressed data mismatch after round-trip")
+	}
+}
+
+func TestSerializationCompressedDataUsesFlateWhenSmaller16Bit(t *testing.T) {
+	rows := make([]string, 30000)
+	for i := range rows {
+		rows[i] = "GET /api/v1/users/42 HTTP/1.1"
+	}
+
+	archive := mustEncode(NewEncoder(), rows)
+	if archive.tokenBitWidth() != tokenBitWidth16 {
+		t.Fatalf("token bit-width mismatch: got %d want %d", archive.tokenBitWidth(), tokenBitWidth16)
+	}
+
+	var blob bytes.Buffer
+	if _, err := archive.WriteTo(&blob); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	r := bytes.NewReader(blob.Bytes())
+	if _, err := io.CopyN(io.Discard, r, 8); err != nil {
+		t.Fatalf("skip archive header failed: %v", err)
+	}
+
+	var stageCount uint16
+	if err := binary.Read(bytes.NewReader(blob.Bytes()[6:8]), binary.LittleEndian, &stageCount); err != nil {
+		t.Fatalf("read stage count failed: %v", err)
+	}
+
+	foundCompressed := false
+	for i := 0; i < int(stageCount); i++ {
+		header, _, err := readStageHeader(r)
+		if err != nil {
+			t.Fatalf("readStageHeader(%d) failed: %v", i, err)
+		}
+		params := make([]byte, header.paramLen)
+		if _, err := io.ReadFull(r, params); err != nil {
+			t.Fatalf("read params(%d) failed: %v", i, err)
+		}
+		payload := make([]byte, header.dataLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			t.Fatalf("read payload(%d) failed: %v", i, err)
+		}
+
+		if header.name != stageCompressedData {
+			continue
+		}
+		foundCompressed = true
+		if len(params) != 1 || params[0] != stageCompressedDataParamWidth16Flate {
+			t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth16Flate)
+		}
+
+		raw, err := encodeCompressedDataStage16(archive.CompressedData)
+		if err != nil {
+			t.Fatalf("encodeCompressedDataStage16 failed: %v", err)
+		}
+		if len(payload) >= len(raw) {
+			t.Fatalf("flate compressed payload not smaller: got %d want < %d", len(payload), len(raw))
+		}
+	}
+	if !foundCompressed {
+		t.Fatalf("compressed_data stage not found")
+	}
+
+	loaded := &Archive{}
+	if _, err := loaded.ReadFrom(bytes.NewReader(blob.Bytes())); err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+	if !slices.Equal(loaded.CompressedData, archive.CompressedData) {
+		t.Fatalf("compressed data mismatch after round-trip")
+	}
+}
+
+func TestSerializationCompressedDataUsesFlateWhenSmaller12Bit(t *testing.T) {
+	rows := make([]string, 30000)
+	for i := range rows {
+		rows[i] = "GET /api/v1/users/42 HTTP/1.1"
+	}
+
+	archive := mustEncode(NewEncoder(WithTokenBitWidth(12)), rows)
+	if archive.tokenBitWidth() != tokenBitWidth12 {
+		t.Fatalf("token bit-width mismatch: got %d want %d", archive.tokenBitWidth(), tokenBitWidth12)
+	}
+
+	var blob bytes.Buffer
+	if _, err := archive.WriteTo(&blob); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	r := bytes.NewReader(blob.Bytes())
+	if _, err := io.CopyN(io.Discard, r, 8); err != nil {
+		t.Fatalf("skip archive header failed: %v", err)
+	}
+
+	var stageCount uint16
+	if err := binary.Read(bytes.NewReader(blob.Bytes()[6:8]), binary.LittleEndian, &stageCount); err != nil {
+		t.Fatalf("read stage count failed: %v", err)
+	}
+
+	foundCompressed := false
+	for i := 0; i < int(stageCount); i++ {
+		header, _, err := readStageHeader(r)
+		if err != nil {
+			t.Fatalf("readStageHeader(%d) failed: %v", i, err)
+		}
+		params := make([]byte, header.paramLen)
+		if _, err := io.ReadFull(r, params); err != nil {
+			t.Fatalf("read params(%d) failed: %v", i, err)
+		}
+		payload := make([]byte, header.dataLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			t.Fatalf("read payload(%d) failed: %v", i, err)
+		}
+
+		if header.name != stageCompressedData {
+			continue
+		}
+		foundCompressed = true
+		if len(params) != 1 || params[0] != stageCompressedDataParamWidth12Flate {
+			t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth12Flate)
+		}
+
+		raw, err := encodeCompressedDataStage12(archive.CompressedData)
+		if err != nil {
+			t.Fatalf("encodeCompressedDataStage12 failed: %v", err)
+		}
+		if len(payload) >= len(raw) {
+			t.Fatalf("flate compressed payload not smaller: got %d want < %d", len(payload), len(raw))
+		}
+	}
+	if !foundCompressed {
+		t.Fatalf("compressed_data stage not found")
+	}
+
+	loaded := &Archive{}
+	if _, err := loaded.ReadFrom(bytes.NewReader(blob.Bytes())); err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+	if !slices.Equal(loaded.CompressedData, archive.CompressedData) {
+		t.Fatalf("compressed data mismatch after round-trip")
+	}
+}
+
+func TestDecodeCompressedDataStageRejectsInvalidFlatePayload(t *testing.T) {
+	dst := &Archive{}
+	err := decodeCompressedDataStage(dst, []byte{stageCompressedDataParamWidth16Flate}, []byte{0x00, 0x01, 0x02, 0x03})
+	if err == nil {
+		t.Fatalf("expected decodeCompressedDataStage to fail on invalid flate payload")
 	}
 }
 

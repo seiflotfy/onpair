@@ -2,6 +2,7 @@ package onpair
 
 import (
 	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -17,10 +18,12 @@ const (
 	stageDictionary       = "dictionary"
 	stageTokenBoundaries  = "token_boundaries"
 
-	stageCompressedDataParamWidth16 = uint8(2)  // legacy 16-bit (2-byte) token IDs
-	stageCompressedDataParamWidth12 = uint8(12) // packed 12-bit token IDs
-	stageStringBoundariesParamDelta = uint8(1)
-	stageTokenBoundariesParamWidth  = uint8(4)
+	stageCompressedDataParamWidth16      = uint8(2)  // raw legacy 16-bit (2-byte) token IDs
+	stageCompressedDataParamWidth16Flate = uint8(3)  // flate(raw 16-bit payload)
+	stageCompressedDataParamWidth12      = uint8(12) // raw packed 12-bit token IDs
+	stageCompressedDataParamWidth12Flate = uint8(13) // flate(raw 12-bit payload)
+	stageStringBoundariesParamDelta      = uint8(1)
+	stageTokenBoundariesParamWidth       = uint8(4)
 
 	maxArchiveStages       = 64
 	maxStagePayloadBytes   = 1 << 30 // 1 GiB
@@ -372,16 +375,67 @@ func encodeCompressedDataStage(a *Archive) ([]byte, uint8, error) {
 		return nil, 0, fmt.Errorf("compressed token count too large: %d", len(a.CompressedData))
 	}
 
+	var (
+		rawPayload   []byte
+		rawParam     uint8
+		flateParam   uint8
+		encodeRawErr error
+	)
 	switch a.tokenBitWidth() {
 	case tokenBitWidth12:
-		payload, err := encodeCompressedDataStage12(a.CompressedData)
-		return payload, stageCompressedDataParamWidth12, err
+		rawPayload, encodeRawErr = encodeCompressedDataStage12(a.CompressedData)
+		rawParam = stageCompressedDataParamWidth12
+		flateParam = stageCompressedDataParamWidth12Flate
 	case tokenBitWidth16:
-		payload, err := encodeCompressedDataStage16(a.CompressedData)
-		return payload, stageCompressedDataParamWidth16, err
+		rawPayload, encodeRawErr = encodeCompressedDataStage16(a.CompressedData)
+		rawParam = stageCompressedDataParamWidth16
+		flateParam = stageCompressedDataParamWidth16Flate
 	default:
 		return nil, 0, fmt.Errorf("unsupported token bit-width: %d", a.compressedTokenBitWidth)
 	}
+	if encodeRawErr != nil {
+		return nil, 0, encodeRawErr
+	}
+
+	flatePayload, err := encodeFlatePayload(rawPayload)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(flatePayload) < len(rawPayload) {
+		return flatePayload, flateParam, nil
+	}
+	return rawPayload, rawParam, nil
+}
+
+func encodeFlatePayload(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(raw); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeFlatePayload(payload []byte) ([]byte, error) {
+	r := flate.NewReader(bytes.NewReader(payload))
+	defer r.Close()
+
+	limited := io.LimitReader(r, maxStagePayloadBytes+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxStagePayloadBytes {
+		return nil, fmt.Errorf("flate payload expands beyond limit")
+	}
+	return raw, nil
 }
 
 func encodeCompressedDataStage16(compressed []uint16) ([]byte, error) {
@@ -521,6 +575,30 @@ func decodeCompressedDataStage(dst *Archive, params []byte, payload []byte) erro
 		return nil
 	case stageCompressedDataParamWidth12:
 		compressedData, err := decodeCompressedDataStage12(payload)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth12
+		return nil
+	case stageCompressedDataParamWidth16Flate:
+		rawPayload, err := decodeFlatePayload(payload)
+		if err != nil {
+			return err
+		}
+		compressedData, err := decodeCompressedDataStage16(rawPayload)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth16
+		return nil
+	case stageCompressedDataParamWidth12Flate:
+		rawPayload, err := decodeFlatePayload(payload)
+		if err != nil {
+			return err
+		}
+		compressedData, err := decodeCompressedDataStage12(rawPayload)
 		if err != nil {
 			return err
 		}

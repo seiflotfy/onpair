@@ -79,6 +79,8 @@ if err != nil {
 
 `WithTokenBitWidth(12)` uses packed 12-bit token IDs in archive storage and
 automatically limits dictionary IDs to `4095`.
+The serialized `compressed_data` stage now auto-selects flate encoding when it
+is smaller than the raw token stream (for both 12-bit and 16-bit payloads).
 
 ## Advanced Features
 
