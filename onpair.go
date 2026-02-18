@@ -22,8 +22,8 @@ type Config struct {
 	MaxTokenLen         int    // Maximum token length (0 = unlimited)
 	TokenBitWidth       uint8  // Encoded token bit-width for archives (0 = default 16, supported: 12 or 16)
 	TrainingSampleBytes int    // Maximum sampled training bytes (0 = default 1 MiB)
-	DrainStratified     bool   // Enable Drain-like stratified sampling for training.
-	DrainMaxClusters    int    // Maximum number of Drain-like clusters for stratified sampling.
+	TemplateStratified  bool   // Enable template-based stratified sampling for training.
+	TemplateMaxClusters int    // Maximum number of template clusters for stratified sampling.
 }
 
 // Option is a functional option for configuring the compressor.
@@ -69,13 +69,13 @@ func WithTrainingSampleBytes(n int) Option {
 	}
 }
 
-// WithDrainStratifiedSampling enables Drain-like stratified sampling when
-// selecting rows used for dictionary training.
+// WithTemplateStratifiedSampling enables template-based stratified sampling
+// when selecting rows used for dictionary training.
 // maxClusters <= 0 uses the default cluster cap.
-func WithDrainStratifiedSampling(maxClusters int) Option {
+func WithTemplateStratifiedSampling(maxClusters int) Option {
 	return func(c *Config) {
-		c.DrainStratified = true
-		c.DrainMaxClusters = maxClusters
+		c.TemplateStratified = true
+		c.TemplateMaxClusters = maxClusters
 	}
 }
 
@@ -105,9 +105,9 @@ func NewEncoder(opts ...Option) *Encoder {
 const maxTrainingSampleBytes = 1024 * 1024 // 1MB
 
 const (
-	defaultDrainMaxClusters    = 2048
-	defaultDrainTemplateTokens = 12
-	drainOtherClusterKey       = "__drain_other__"
+	defaultTemplateMaxClusters = 2048
+	defaultTemplateTokens      = 12
+	templateOtherClusterKey    = "__template_other__"
 )
 
 func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []uint32) {
@@ -149,9 +149,9 @@ func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []ui
 	sampleBytes := len(data)
 	trainingSampleBytes := resolveTrainingSampleBytes(e.config)
 	if len(data) > trainingSampleBytes {
-		if e.config.DrainStratified {
-			maxClusters := resolveDrainMaxClusters(e.config)
-			sampleIndices, sampleBytes = stratifiedSampleIndicesByDrainLike(
+		if e.config.TemplateStratified {
+			maxClusters := resolveTemplateMaxClusters(e.config)
+			sampleIndices, sampleBytes = stratifiedSampleIndicesByTemplateKey(
 				data, endPositions, shuffledIndices, trainingSampleBytes, maxClusters,
 			)
 		} else {
@@ -215,11 +215,11 @@ func resolveTrainingSampleBytes(cfg Config) int {
 	return maxTrainingSampleBytes
 }
 
-func resolveDrainMaxClusters(cfg Config) int {
-	if cfg.DrainMaxClusters > 0 {
-		return cfg.DrainMaxClusters
+func resolveTemplateMaxClusters(cfg Config) int {
+	if cfg.TemplateMaxClusters > 0 {
+		return cfg.TemplateMaxClusters
 	}
-	return defaultDrainMaxClusters
+	return defaultTemplateMaxClusters
 }
 
 func sampleIndicesByBytes(shuffledIndices []int, endPositions []int, sampleLimit int) ([]int, int) {
@@ -238,7 +238,7 @@ func sampleIndicesByBytes(shuffledIndices []int, endPositions []int, sampleLimit
 	return shuffledIndices, sampleSize
 }
 
-func stratifiedSampleIndicesByDrainLike(
+func stratifiedSampleIndicesByTemplateKey(
 	data []byte,
 	endPositions []int,
 	shuffledIndices []int,
@@ -257,11 +257,11 @@ func stratifiedSampleIndicesByDrainLike(
 		start := endPositions[idx]
 		end := endPositions[idx+1]
 		totalPoolBytes += end - start
-		key := drainLikeTemplateKey(data[start:end], defaultDrainTemplateTokens)
+		key := templateKeyFromLine(data[start:end], defaultTemplateTokens)
 
 		if _, exists := clusterGroups[key]; !exists {
 			if maxClusters > 0 && len(clusterGroups) >= maxClusters {
-				key = drainOtherClusterKey
+				key = templateOtherClusterKey
 				if _, hasOther := clusterGroups[key]; !hasOther {
 					clusterGroups[key] = nil
 					clusterOrder = append(clusterOrder, key)
@@ -377,7 +377,7 @@ func stratifiedSampleIndicesByDrainLike(
 	return sampleIndices, sampleBytes
 }
 
-func drainLikeTemplateKey(line []byte, maxTokens int) string {
+func templateKeyFromLine(line []byte, maxTokens int) string {
 	if len(line) == 0 {
 		return ""
 	}
@@ -394,13 +394,13 @@ func drainLikeTemplateKey(line []byte, maxTokens int) string {
 		if i > 0 {
 			key = append(key, ' ')
 		}
-		key = appendDrainNormalizedToken(key, field)
+		key = appendTemplateNormalizedToken(key, field)
 	}
 	return string(key)
 }
 
-func appendDrainNormalizedToken(dst []byte, token []byte) []byte {
-	trimmed := trimDrainToken(token)
+func appendTemplateNormalizedToken(dst []byte, token []byte) []byte {
+	trimmed := trimTemplateToken(token)
 	if len(trimmed) == 0 {
 		return append(dst, "<*>"...)
 	}
@@ -408,12 +408,12 @@ func appendDrainNormalizedToken(dst []byte, token []byte) []byte {
 		for _, b := range trimmed[:eq+1] {
 			dst = append(dst, toLowerASCII(b))
 		}
-		return appendDrainNormalizedValue(dst, trimmed[eq+1:])
+		return appendTemplateNormalizedValue(dst, trimmed[eq+1:])
 	}
-	return appendDrainNormalizedValue(dst, trimmed)
+	return appendTemplateNormalizedValue(dst, trimmed)
 }
 
-func appendDrainNormalizedValue(dst []byte, token []byte) []byte {
+func appendTemplateNormalizedValue(dst []byte, token []byte) []byte {
 	if len(token) == 0 {
 		return append(dst, "<*>"...)
 	}
@@ -440,18 +440,18 @@ func appendDrainNormalizedValue(dst []byte, token []byte) []byte {
 	return dst
 }
 
-func trimDrainToken(token []byte) []byte {
+func trimTemplateToken(token []byte) []byte {
 	start, end := 0, len(token)
-	for start < end && isDrainTrimPunct(token[start]) {
+	for start < end && isTemplateTrimPunct(token[start]) {
 		start++
 	}
-	for end > start && isDrainTrimPunct(token[end-1]) {
+	for end > start && isTemplateTrimPunct(token[end-1]) {
 		end--
 	}
 	return token[start:end]
 }
 
-func isDrainTrimPunct(b byte) bool {
+func isTemplateTrimPunct(b byte) bool {
 	switch b {
 	case '[', ']', '(', ')', '{', '}', '<', '>', ',', ';', ':', '\'', '"':
 		return true

@@ -432,18 +432,28 @@ func TestResolveTrainingSampleBytes(t *testing.T) {
 	}
 }
 
-func TestResolveDrainMaxClusters(t *testing.T) {
-	if got := resolveDrainMaxClusters(Config{}); got != defaultDrainMaxClusters {
-		t.Fatalf("default drain max clusters: got %d want %d", got, defaultDrainMaxClusters)
+func TestResolveTemplateMaxClusters(t *testing.T) {
+	if got := resolveTemplateMaxClusters(Config{}); got != defaultTemplateMaxClusters {
+		t.Fatalf("default template max clusters: got %d want %d", got, defaultTemplateMaxClusters)
 	}
-	if got := resolveDrainMaxClusters(Config{DrainMaxClusters: 32}); got != 32 {
-		t.Fatalf("custom drain max clusters: got %d want %d", got, 32)
+	if got := resolveTemplateMaxClusters(Config{TemplateMaxClusters: 32}); got != 32 {
+		t.Fatalf("custom template max clusters: got %d want %d", got, 32)
 	}
 }
 
-func TestDrainLikeTemplateKeyNormalizesDynamicTokens(t *testing.T) {
+func TestWithTemplateStratifiedSamplingOption(t *testing.T) {
+	enc := NewEncoder(WithTemplateStratifiedSampling(512))
+	if !enc.config.TemplateStratified {
+		t.Fatalf("template stratified sampling should be enabled")
+	}
+	if enc.config.TemplateMaxClusters != 512 {
+		t.Fatalf("template max clusters mismatch: got %d want %d", enc.config.TemplateMaxClusters, 512)
+	}
+}
+
+func TestTemplateKeyFromLineNormalizesDynamicTokens(t *testing.T) {
 	line := []byte(`[2025-09-12T12:00:00Z] INFO client=10.1.2.3 req=550e8400-e29b-41d4-a716-446655440000 status=500`)
-	key := drainLikeTemplateKey(line, 16)
+	key := templateKeyFromLine(line, 16)
 
 	if !strings.Contains(key, "<IP>") {
 		t.Fatalf("expected key to contain <IP>, got %q", key)
@@ -456,7 +466,7 @@ func TestDrainLikeTemplateKeyNormalizesDynamicTokens(t *testing.T) {
 	}
 }
 
-func TestStratifiedSampleIndicesByDrainLike(t *testing.T) {
+func TestStratifiedSampleIndicesByTemplateKey(t *testing.T) {
 	rows := []string{
 		"INFO service=a status=200 dur=10",
 		"INFO service=a status=200 dur=11",
@@ -469,7 +479,7 @@ func TestStratifiedSampleIndicesByDrainLike(t *testing.T) {
 	shuffled := []int{0, 1, 2, 3, 4, 5}
 	sampleLimit := len(rows[0]) + len(rows[3])
 
-	sample, sampleBytes := stratifiedSampleIndicesByDrainLike(data, endPositions, shuffled, sampleLimit, 8)
+	sample, sampleBytes := stratifiedSampleIndicesByTemplateKey(data, endPositions, shuffled, sampleLimit, 8)
 	if len(sample) == 0 || sampleBytes == 0 {
 		t.Fatalf("expected non-empty sample")
 	}
@@ -1306,8 +1316,17 @@ func TestSerializationPacked12Bit(t *testing.T) {
 			if len(params) != 1 {
 				t.Fatalf("compressed_data params length mismatch: got %d want 1", len(params))
 			}
-			if params[0] != stageCompressedDataParamWidth12 && params[0] != stageCompressedDataParamWidth12Flate {
-				t.Fatalf("compressed_data params mismatch: got %v want [%d or %d]", params, stageCompressedDataParamWidth12, stageCompressedDataParamWidth12Flate)
+			if params[0] != stageCompressedDataParamWidth12 &&
+				params[0] != stageCompressedDataParamWidth12Flate &&
+				params[0] != stageCompressedDataParamWidth12Codebook &&
+				params[0] != stageCompressedDataParamWidth12CodebookFlate {
+				t.Fatalf("compressed_data params mismatch: got %v want [%d/%d/%d/%d]",
+					params,
+					stageCompressedDataParamWidth12,
+					stageCompressedDataParamWidth12Flate,
+					stageCompressedDataParamWidth12Codebook,
+					stageCompressedDataParamWidth12CodebookFlate,
+				)
 			}
 			if params[0] == stageCompressedDataParamWidth12 {
 				expectedPayloadLen := uint32(4 + expectedCompressedBytes)
@@ -1382,8 +1401,18 @@ func TestSerializationCompressedDataUsesFlateWhenSmaller16Bit(t *testing.T) {
 			continue
 		}
 		foundCompressed = true
-		if len(params) != 1 || params[0] != stageCompressedDataParamWidth16Flate {
-			t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth16Flate)
+		if len(params) != 1 {
+			t.Fatalf("compressed_data params length mismatch: got %d want 1", len(params))
+		}
+		if params[0] != stageCompressedDataParamWidth16Flate &&
+			params[0] != stageCompressedDataParamWidth16Codebook &&
+			params[0] != stageCompressedDataParamWidth16CodebookFlate {
+			t.Fatalf("compressed_data params mismatch: got %v want one of [%d/%d/%d]",
+				params,
+				stageCompressedDataParamWidth16Flate,
+				stageCompressedDataParamWidth16Codebook,
+				stageCompressedDataParamWidth16CodebookFlate,
+			)
 		}
 
 		raw, err := encodeCompressedDataStage16(archive.CompressedData)
@@ -1452,8 +1481,18 @@ func TestSerializationCompressedDataUsesFlateWhenSmaller12Bit(t *testing.T) {
 			continue
 		}
 		foundCompressed = true
-		if len(params) != 1 || params[0] != stageCompressedDataParamWidth12Flate {
-			t.Fatalf("compressed_data params mismatch: got %v want [%d]", params, stageCompressedDataParamWidth12Flate)
+		if len(params) != 1 {
+			t.Fatalf("compressed_data params length mismatch: got %d want 1", len(params))
+		}
+		if params[0] != stageCompressedDataParamWidth12Flate &&
+			params[0] != stageCompressedDataParamWidth12Codebook &&
+			params[0] != stageCompressedDataParamWidth12CodebookFlate {
+			t.Fatalf("compressed_data params mismatch: got %v want one of [%d/%d/%d]",
+				params,
+				stageCompressedDataParamWidth12Flate,
+				stageCompressedDataParamWidth12Codebook,
+				stageCompressedDataParamWidth12CodebookFlate,
+			)
 		}
 
 		raw, err := encodeCompressedDataStage12(archive.CompressedData)
@@ -1482,6 +1521,62 @@ func TestDecodeCompressedDataStageRejectsInvalidFlatePayload(t *testing.T) {
 	err := decodeCompressedDataStage(dst, []byte{stageCompressedDataParamWidth16Flate}, []byte{0x00, 0x01, 0x02, 0x03})
 	if err == nil {
 		t.Fatalf("expected decodeCompressedDataStage to fail on invalid flate payload")
+	}
+}
+
+func TestCompressedDataCodebookRoundTrip16Bit(t *testing.T) {
+	compressed := []uint16{
+		10, 10, 10, 10, 11, 10, 12, 10, 13, 10, 14, 10, 10, 10, 15, 16, 10, 17, 18, 10,
+		500, 501, 500, 500, 502, 503, 500, 504, 505, 500,
+	}
+
+	payload, err := encodeCompressedDataStageCodebook(compressed, tokenBitWidth16)
+	if err != nil {
+		t.Fatalf("encodeCompressedDataStageCodebook failed: %v", err)
+	}
+
+	decoded, err := decodeCompressedDataStageCodebook(payload, tokenBitWidth16)
+	if err != nil {
+		t.Fatalf("decodeCompressedDataStageCodebook failed: %v", err)
+	}
+
+	if !slices.Equal(decoded, compressed) {
+		t.Fatalf("codebook round-trip mismatch")
+	}
+}
+
+func TestCompressedDataCodebookRoundTrip12Bit(t *testing.T) {
+	compressed := []uint16{
+		1, 1, 1, 2, 3, 4, 1, 5, 1, 100, 101, 100, 100, 102, 100, 103, 1, 1, 1, 104,
+	}
+
+	payload, err := encodeCompressedDataStageCodebook(compressed, tokenBitWidth12)
+	if err != nil {
+		t.Fatalf("encodeCompressedDataStageCodebook failed: %v", err)
+	}
+
+	decoded, err := decodeCompressedDataStageCodebook(payload, tokenBitWidth12)
+	if err != nil {
+		t.Fatalf("decodeCompressedDataStageCodebook failed: %v", err)
+	}
+
+	if !slices.Equal(decoded, compressed) {
+		t.Fatalf("codebook round-trip mismatch")
+	}
+}
+
+func TestDecodeCompressedDataStageRejectsInvalidCodebookPayload(t *testing.T) {
+	// compressedLen=1, codebookLen=1, codebook[0]=7, stream code=1 (out of range)
+	payload := []byte{
+		0x01, 0x00, 0x00, 0x00,
+		0x01, 0x00,
+		0x07, 0x00,
+		0x01,
+	}
+	dst := &Archive{}
+	err := decodeCompressedDataStage(dst, []byte{stageCompressedDataParamWidth16Codebook}, payload)
+	if err == nil {
+		t.Fatalf("expected decodeCompressedDataStage to fail on invalid codebook payload")
 	}
 }
 
@@ -1761,6 +1856,111 @@ func TestDeltaEncodingSavings(t *testing.T) {
 		if archive2.StringBoundaries[i] != archive.StringBoundaries[i] {
 			t.Errorf("Boundary %d mismatch: got %d, want %d", i, archive2.StringBoundaries[i], archive.StringBoundaries[i])
 		}
+	}
+}
+
+func TestEncodeTokenBoundariesStageSelectsDelta(t *testing.T) {
+	bounds := []uint32{0, 1, 2, 3, 5, 8, 13, 21}
+	archive := &Archive{TokenBoundaries: bounds}
+
+	payload, param, err := encodeTokenBoundariesStage(archive)
+	if err != nil {
+		t.Fatalf("encodeTokenBoundariesStage failed: %v", err)
+	}
+	if param != stageTokenBoundariesParamDelta {
+		t.Fatalf("param mismatch: got %d want %d", param, stageTokenBoundariesParamDelta)
+	}
+
+	expectedPayload, err := encodeTokenBoundariesStageDelta(bounds)
+	if err != nil {
+		t.Fatalf("encodeTokenBoundariesStageDelta failed: %v", err)
+	}
+	if !bytes.Equal(payload, expectedPayload) {
+		t.Fatalf("delta payload mismatch")
+	}
+
+	var decoded Archive
+	if err := decodeTokenBoundariesStage(&decoded, []byte{param}, payload); err != nil {
+		t.Fatalf("decodeTokenBoundariesStage failed: %v", err)
+	}
+	if !slices.Equal(decoded.TokenBoundaries, bounds) {
+		t.Fatalf("decoded boundaries mismatch: got %v want %v", decoded.TokenBoundaries, bounds)
+	}
+}
+
+func TestEncodeTokenBoundariesStageSelectsRawWhenSmaller(t *testing.T) {
+	bounds := []uint32{0, ^uint32(0)}
+	archive := &Archive{TokenBoundaries: bounds}
+
+	payload, param, err := encodeTokenBoundariesStage(archive)
+	if err != nil {
+		t.Fatalf("encodeTokenBoundariesStage failed: %v", err)
+	}
+	if param != stageTokenBoundariesParamWidth {
+		t.Fatalf("param mismatch: got %d want %d", param, stageTokenBoundariesParamWidth)
+	}
+
+	expectedPayload, err := encodeTokenBoundariesStageRaw(bounds)
+	if err != nil {
+		t.Fatalf("encodeTokenBoundariesStageRaw failed: %v", err)
+	}
+	if !bytes.Equal(payload, expectedPayload) {
+		t.Fatalf("raw payload mismatch")
+	}
+}
+
+func TestWriteToUsesSelectedTokenBoundariesParam(t *testing.T) {
+	dictionary := make([]byte, 10)
+	for i := range dictionary {
+		dictionary[i] = byte(i)
+	}
+
+	archive := &Archive{
+		CompressedData:   []uint16{0},
+		StringBoundaries: []int{0, 1},
+		Dictionary:       dictionary,
+		TokenBoundaries:  []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+	}
+
+	var blob bytes.Buffer
+	if _, err := archive.WriteTo(&blob); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	r := bytes.NewReader(blob.Bytes())
+	if _, err := io.CopyN(io.Discard, r, 6); err != nil { // magic + version
+		t.Fatalf("skip archive header failed: %v", err)
+	}
+	var stageCount uint16
+	if err := binary.Read(r, binary.LittleEndian, &stageCount); err != nil {
+		t.Fatalf("read stage count failed: %v", err)
+	}
+
+	found := false
+	for i := 0; i < int(stageCount); i++ {
+		header, _, err := readStageHeader(r)
+		if err != nil {
+			t.Fatalf("readStageHeader(%d) failed: %v", i, err)
+		}
+		params := make([]byte, header.paramLen)
+		if _, err := io.ReadFull(r, params); err != nil {
+			t.Fatalf("read params(%d) failed: %v", i, err)
+		}
+		if header.name == stageTokenBoundaries {
+			found = true
+			if len(params) != 1 {
+				t.Fatalf("token_boundaries params length mismatch: got %d want 1", len(params))
+			}
+			if params[0] != stageTokenBoundariesParamDelta {
+				t.Fatalf("token_boundaries param mismatch: got %d want %d", params[0], stageTokenBoundariesParamDelta)
+			}
+		}
+		if _, err := io.CopyN(io.Discard, r, int64(header.dataLen)); err != nil {
+			t.Fatalf("skip payload(%d) failed: %v", i, err)
+		}
+	}
+	if !found {
+		t.Fatalf("token_boundaries stage not found")
 	}
 }
 

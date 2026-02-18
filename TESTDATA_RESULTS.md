@@ -84,69 +84,56 @@ OnPair supports both individual string compression and bulk operations:
 
 ```go
 // Compress collection of strings
-dict := onpair.New()
-dict.CompressStrings([]string{"user_001", "user_002", "admin_001"})
+enc := onpair.NewEncoder()
+archive, err := enc.Encode([]string{"user_001", "user_002", "admin_001"})
+if err != nil {
+    panic(err)
+}
 
 // Random access decompression
 buffer := make([]byte, 256)
-size := dict.DecompressString(0, buffer)
-
-// Error-checked decompression
-size, err := dict.DecompressStringChecked(0, buffer)
+n, err := archive.DecompressString(0, buffer)
+if err != nil {
+    panic(err)
+}
+_ = string(buffer[:n])
 ```
 
 ### Serialization and Persistence
 
-Save and load dictionaries with optimized bulk I/O:
+Save and load archives with optimized bulk I/O:
 
 ```go
-// Save dictionary
-file, _ := os.Create("dict.bin")
-dict.WriteTo(file)
-file.Close()
+var blob bytes.Buffer
+if _, err := archive.WriteTo(&blob); err != nil {
+    panic(err)
+}
 
-// Load dictionary
-file, _ = os.Open("dict.bin")
-loadedDict := &onpair.Dictionary{}
-loadedDict.ReadFrom(file)
-file.Close()
+loaded := &onpair.Archive{}
+if _, err := loaded.ReadFrom(bytes.NewReader(blob.Bytes())); err != nil {
+    panic(err)
+}
 ```
 
 **Performance**: Bulk write operations reduce system calls and improve serialization speed significantly over element-by-element writes.
 
-### Dictionary Inspection
+### Archive Inspection
 
 Query metadata and inspect tokens:
 
 ```go
-dict.NumStrings()    // Number of compressed strings
-dict.NumTokens()     // Number of tokens in dictionary
-dict.SpaceUsed()     // Total compressed size in bytes
-dict.GetToken(256)   // Retrieve specific token by ID
+archive.Rows()       // Number of compressed strings
+archive.SpaceUsed()  // Total compressed size in bytes (in-memory representation)
 ```
 
-### Validation and Cloning
+### Bulk Decode
 
-Ensure integrity and create independent copies:
+Decode entire collections with explicit error handling:
 
 ```go
-// Validate dictionary structure
-if err := dict.Validate(); err != nil {
-    log.Fatal("Corrupted dictionary:", err)
+dst, err := archive.AppendAll(nil)
+if err != nil {
+    panic(err)
 }
-
-// Deep copy for concurrent access
-clone := dict.Clone()
+_ = dst
 ```
-
-## Test Coverage
-
-```bash
-# Run all tests
-go test -v ./...
-
-# Run benchmarks
-go test -bench=. ./...
-```
-
-All 32 tests pass ✅ (includes compression, decompression, serialization, delta encoding, validation, and cloning tests)

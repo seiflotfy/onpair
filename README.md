@@ -69,7 +69,7 @@ enc := onpair.NewEncoder(
     onpair.WithMaxTokenID(4095),   // optional smaller dictionary cap
     onpair.WithTokenBitWidth(12),  // optional packed 12-bit token stream
     onpair.WithTrainingSampleBytes(8*1024*1024), // optional larger training sample
-    onpair.WithDrainStratifiedSampling(2048),    // optional Drain-like stratified sampling
+    onpair.WithTemplateStratifiedSampling(2048), // optional template-based stratified sampling
 )
 archive, err := enc.Encode([]string{"user_001", "user_002", "admin_001"})
 if err != nil {
@@ -79,8 +79,11 @@ if err != nil {
 
 `WithTokenBitWidth(12)` uses packed 12-bit token IDs in archive storage and
 automatically limits dictionary IDs to `4095`.
-The serialized `compressed_data` stage now auto-selects flate encoding when it
-is smaller than the raw token stream (for both 12-bit and 16-bit payloads).
+The serialized `compressed_data` stage now auto-selects the smallest among raw,
+flate(raw), byte-codebook+escape, and flate(codebook) for both 12-bit and
+16-bit token streams.
+`WithTemplateStratifiedSampling` uses a lightweight template normalization
+heuristic for sample balancing; it is not a full log-template parser.
 
 ## Advanced Features
 
@@ -164,7 +167,7 @@ _ = out
 - `WithMaxTokenID(maxID uint16) Option`
 - `WithTokenBitWidth(bits uint8) Option` (`12` or `16`, default `16`)
 - `WithTrainingSampleBytes(n int) Option` (default `1 MiB`)
-- `WithDrainStratifiedSampling(maxClusters int) Option`
+- `WithTemplateStratifiedSampling(maxClusters int) Option`
 
 ### Encode/decode
 

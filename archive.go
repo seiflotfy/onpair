@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"strconv"
+	"sort"
 )
 
 const (
@@ -18,18 +18,27 @@ const (
 	stageDictionary       = "dictionary"
 	stageTokenBoundaries  = "token_boundaries"
 
-	stageCompressedDataParamWidth16      = uint8(2)  // raw legacy 16-bit (2-byte) token IDs
-	stageCompressedDataParamWidth16Flate = uint8(3)  // flate(raw 16-bit payload)
-	stageCompressedDataParamWidth12      = uint8(12) // raw packed 12-bit token IDs
-	stageCompressedDataParamWidth12Flate = uint8(13) // flate(raw 12-bit payload)
-	stageStringBoundariesParamDelta      = uint8(1)
-	stageTokenBoundariesParamWidth       = uint8(4)
+	stageCompressedDataParamWidth16              = uint8(2)  // raw legacy 16-bit (2-byte) token IDs
+	stageCompressedDataParamWidth16Flate         = uint8(3)  // flate(raw 16-bit payload)
+	stageCompressedDataParamWidth16Codebook      = uint8(4)  // byte codebook + escape stream (16-bit token IDs)
+	stageCompressedDataParamWidth16CodebookFlate = uint8(5)  // flate(codebook stream for 16-bit token IDs)
+	stageCompressedDataParamWidth12              = uint8(12) // raw packed 12-bit token IDs
+	stageCompressedDataParamWidth12Flate         = uint8(13) // flate(raw 12-bit payload)
+	stageCompressedDataParamWidth12Codebook      = uint8(14) // byte codebook + escape stream (12-bit token IDs)
+	stageCompressedDataParamWidth12CodebookFlate = uint8(15) // flate(codebook stream for 12-bit token IDs)
+	stageStringBoundariesParamDelta              = uint8(1)
+	stageTokenBoundariesParamWidth               = uint8(4) // raw uint32 boundaries
+	stageTokenBoundariesParamDelta               = uint8(5) // first boundary + varint deltas
 
 	maxArchiveStages       = 64
 	maxStagePayloadBytes   = 1 << 30 // 1 GiB
 	maxCompressedTokenRead = maxStagePayloadBytes / 2
-	maxBoundaryCountRead   = maxStagePayloadBytes / (strconv.IntSize / 8)
+	maxBoundaryCountRead   = maxStagePayloadBytes / 8
 	maxTokenBoundsRead     = maxStagePayloadBytes / 4
+	maxStringBoundaryValue = uint64(maxCompressedTokenRead)
+
+	compressedDataCodebookEscapeByte = uint8(0xFF)
+	compressedDataCodebookMaxEntries = int(compressedDataCodebookEscapeByte)
 )
 
 // Wire format (version 2):
@@ -376,20 +385,26 @@ func encodeCompressedDataStage(a *Archive) ([]byte, uint8, error) {
 	}
 
 	var (
-		rawPayload   []byte
-		rawParam     uint8
-		flateParam   uint8
-		encodeRawErr error
+		rawPayload        []byte
+		rawParam          uint8
+		flateParam        uint8
+		codebookParam     uint8
+		codebookFlateParm uint8
+		encodeRawErr      error
 	)
 	switch a.tokenBitWidth() {
 	case tokenBitWidth12:
 		rawPayload, encodeRawErr = encodeCompressedDataStage12(a.CompressedData)
 		rawParam = stageCompressedDataParamWidth12
 		flateParam = stageCompressedDataParamWidth12Flate
+		codebookParam = stageCompressedDataParamWidth12Codebook
+		codebookFlateParm = stageCompressedDataParamWidth12CodebookFlate
 	case tokenBitWidth16:
 		rawPayload, encodeRawErr = encodeCompressedDataStage16(a.CompressedData)
 		rawParam = stageCompressedDataParamWidth16
 		flateParam = stageCompressedDataParamWidth16Flate
+		codebookParam = stageCompressedDataParamWidth16Codebook
+		codebookFlateParm = stageCompressedDataParamWidth16CodebookFlate
 	default:
 		return nil, 0, fmt.Errorf("unsupported token bit-width: %d", a.compressedTokenBitWidth)
 	}
@@ -397,14 +412,38 @@ func encodeCompressedDataStage(a *Archive) ([]byte, uint8, error) {
 		return nil, 0, encodeRawErr
 	}
 
+	type candidate struct {
+		payload []byte
+		param   uint8
+	}
+	candidates := []candidate{
+		{payload: rawPayload, param: rawParam},
+	}
+
 	flatePayload, err := encodeFlatePayload(rawPayload)
 	if err != nil {
 		return nil, 0, err
 	}
-	if len(flatePayload) < len(rawPayload) {
-		return flatePayload, flateParam, nil
+	candidates = append(candidates, candidate{payload: flatePayload, param: flateParam})
+
+	codebookPayload, codebookErr := encodeCompressedDataStageCodebook(a.CompressedData, a.tokenBitWidth())
+	if codebookErr == nil {
+		candidates = append(candidates, candidate{payload: codebookPayload, param: codebookParam})
+
+		flateCodebook, err := encodeFlatePayload(codebookPayload)
+		if err != nil {
+			return nil, 0, err
+		}
+		candidates = append(candidates, candidate{payload: flateCodebook, param: codebookFlateParm})
 	}
-	return rawPayload, rawParam, nil
+
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if len(candidate.payload) < len(best.payload) {
+			best = candidate
+		}
+	}
+	return best.payload, best.param, nil
 }
 
 func encodeFlatePayload(raw []byte) ([]byte, error) {
@@ -436,6 +475,169 @@ func decodeFlatePayload(payload []byte) ([]byte, error) {
 		return nil, fmt.Errorf("flate payload expands beyond limit")
 	}
 	return raw, nil
+}
+
+type tokenFrequency struct {
+	tokenID uint16
+	count   uint32
+}
+
+func encodeCompressedDataStageCodebook(compressed []uint16, tokenBitWidth uint8) ([]byte, error) {
+	if len(compressed) > maxCompressedTokenRead {
+		return nil, fmt.Errorf("compressed token count too large: %d", len(compressed))
+	}
+
+	var maxTokenID uint16
+	for i, tokenID := range compressed {
+		if tokenBitWidth == tokenBitWidth12 && tokenID > maxTokenID12Bit {
+			return nil, fmt.Errorf("compressed token out of 12-bit range at index %d: %d", i, tokenID)
+		}
+		if tokenID > maxTokenID {
+			maxTokenID = tokenID
+		}
+	}
+
+	counts := make([]uint32, int(maxTokenID)+1)
+	for _, tokenID := range compressed {
+		counts[tokenID]++
+	}
+
+	frequencies := make([]tokenFrequency, 0, len(counts))
+	for tokenID, count := range counts {
+		if count == 0 {
+			continue
+		}
+		frequencies = append(frequencies, tokenFrequency{
+			tokenID: uint16(tokenID),
+			count:   count,
+		})
+	}
+	sort.Slice(frequencies, func(i, j int) bool {
+		if frequencies[i].count != frequencies[j].count {
+			return frequencies[i].count > frequencies[j].count
+		}
+		return frequencies[i].tokenID < frequencies[j].tokenID
+	})
+
+	codebookLen := len(frequencies)
+	if codebookLen > compressedDataCodebookMaxEntries {
+		codebookLen = compressedDataCodebookMaxEntries
+	}
+
+	codeByToken := make([]uint8, len(counts))
+	for i := range codeByToken {
+		codeByToken[i] = compressedDataCodebookEscapeByte
+	}
+	for i := 0; i < codebookLen; i++ {
+		codeByToken[frequencies[i].tokenID] = uint8(i)
+	}
+
+	payloadLen := uint64(4 + 2 + codebookLen*2)
+	for _, tokenID := range compressed {
+		if codeByToken[tokenID] == compressedDataCodebookEscapeByte {
+			payloadLen += 3
+			continue
+		}
+		payloadLen++
+	}
+	if payloadLen > uint64(maxStagePayloadBytes) {
+		return nil, fmt.Errorf("compressed_data codebook payload too large: %d", payloadLen)
+	}
+
+	payload := make([]byte, int(payloadLen))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(len(compressed)))
+	binary.LittleEndian.PutUint16(payload[4:6], uint16(codebookLen))
+
+	outIdx := 6
+	for i := 0; i < codebookLen; i++ {
+		binary.LittleEndian.PutUint16(payload[outIdx:outIdx+2], frequencies[i].tokenID)
+		outIdx += 2
+	}
+
+	for _, tokenID := range compressed {
+		code := codeByToken[tokenID]
+		if code != compressedDataCodebookEscapeByte {
+			payload[outIdx] = code
+			outIdx++
+			continue
+		}
+		payload[outIdx] = compressedDataCodebookEscapeByte
+		outIdx++
+		binary.LittleEndian.PutUint16(payload[outIdx:outIdx+2], tokenID)
+		outIdx += 2
+	}
+
+	if outIdx != len(payload) {
+		return nil, fmt.Errorf("compressed_data codebook payload mismatch: wrote %d bytes, expected %d", outIdx, len(payload))
+	}
+	return payload, nil
+}
+
+func decodeCompressedDataStageCodebook(payload []byte, tokenBitWidth uint8) ([]uint16, error) {
+	if len(payload) < 6 {
+		return nil, fmt.Errorf("compressed_data codebook payload too short: %d", len(payload))
+	}
+
+	compressedLen := binary.LittleEndian.Uint32(payload[:4])
+	if compressedLen > uint32(maxCompressedTokenRead) {
+		return nil, fmt.Errorf("compressed token count too large: %d", compressedLen)
+	}
+
+	codebookLen := int(binary.LittleEndian.Uint16(payload[4:6]))
+	if codebookLen > compressedDataCodebookMaxEntries {
+		return nil, fmt.Errorf("compressed_data codebook length too large: %d", codebookLen)
+	}
+
+	headerLen := 6 + codebookLen*2
+	if len(payload) < headerLen {
+		return nil, fmt.Errorf("compressed_data codebook payload too short for dictionary: %d", len(payload))
+	}
+
+	codebook := make([]uint16, codebookLen)
+	inIdx := 6
+	for i := 0; i < codebookLen; i++ {
+		tokenID := binary.LittleEndian.Uint16(payload[inIdx : inIdx+2])
+		inIdx += 2
+		if tokenBitWidth == tokenBitWidth12 && tokenID > maxTokenID12Bit {
+			return nil, fmt.Errorf("compressed_data codebook token out of 12-bit range at code %d: %d", i, tokenID)
+		}
+		codebook[i] = tokenID
+	}
+
+	stream := payload[headerLen:]
+	compressedData := make([]uint16, compressedLen)
+	inIdx = 0
+	for i := 0; i < len(compressedData); i++ {
+		if inIdx >= len(stream) {
+			return nil, fmt.Errorf("compressed_data codebook payload underrun at token %d", i)
+		}
+
+		code := stream[inIdx]
+		inIdx++
+		if code != compressedDataCodebookEscapeByte {
+			codeIdx := int(code)
+			if codeIdx >= len(codebook) {
+				return nil, fmt.Errorf("compressed_data codebook index out of range at token %d: %d", i, codeIdx)
+			}
+			compressedData[i] = codebook[codeIdx]
+			continue
+		}
+
+		if inIdx+2 > len(stream) {
+			return nil, fmt.Errorf("compressed_data codebook escape underrun at token %d", i)
+		}
+		tokenID := binary.LittleEndian.Uint16(stream[inIdx : inIdx+2])
+		inIdx += 2
+		if tokenBitWidth == tokenBitWidth12 && tokenID > maxTokenID12Bit {
+			return nil, fmt.Errorf("compressed_data codebook escape token out of 12-bit range at token %d: %d", i, tokenID)
+		}
+		compressedData[i] = tokenID
+	}
+
+	if inIdx != len(stream) {
+		return nil, fmt.Errorf("compressed_data codebook trailing bytes: %d", len(stream)-inIdx)
+	}
+	return compressedData, nil
 }
 
 func encodeCompressedDataStage16(compressed []uint16) ([]byte, error) {
@@ -490,7 +692,6 @@ func encodeStringBoundariesStage(a *Archive) ([]byte, error) {
 		return nil, fmt.Errorf("string boundary count too large: %d", len(a.StringBoundaries))
 	}
 
-	const maxIntValue = int(^uint(0) >> 1)
 	var buf bytes.Buffer
 	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(a.StringBoundaries))); err != nil {
 		return nil, err
@@ -502,8 +703,8 @@ func encodeStringBoundariesStage(a *Archive) ([]byte, error) {
 	if a.StringBoundaries[0] < 0 {
 		return nil, fmt.Errorf("first string boundary is negative: %d", a.StringBoundaries[0])
 	}
-	if a.StringBoundaries[0] > maxIntValue {
-		return nil, fmt.Errorf("first string boundary overflows int: %d", a.StringBoundaries[0])
+	if uint64(a.StringBoundaries[0]) > maxStringBoundaryValue {
+		return nil, fmt.Errorf("first string boundary exceeds max supported value: %d", a.StringBoundaries[0])
 	}
 	if err := binary.Write(&buf, binary.LittleEndian, uint64(a.StringBoundaries[0])); err != nil {
 		return nil, err
@@ -544,16 +745,64 @@ func encodeDictionaryStage(a *Archive) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func encodeTokenBoundariesStage(a *Archive) ([]byte, error) {
+func encodeTokenBoundariesStage(a *Archive) ([]byte, uint8, error) {
 	if len(a.TokenBoundaries) > maxTokenBoundsRead {
-		return nil, fmt.Errorf("token boundary count too large: %d", len(a.TokenBoundaries))
+		return nil, 0, fmt.Errorf("token boundary count too large: %d", len(a.TokenBoundaries))
 	}
 
+	rawPayload, err := encodeTokenBoundariesStageRaw(a.TokenBoundaries)
+	if err != nil {
+		return nil, 0, err
+	}
+	deltaPayload, err := encodeTokenBoundariesStageDelta(a.TokenBoundaries)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(deltaPayload) < len(rawPayload) {
+		return deltaPayload, stageTokenBoundariesParamDelta, nil
+	}
+	return rawPayload, stageTokenBoundariesParamWidth, nil
+}
+
+func encodeTokenBoundariesStageRaw(bounds []uint32) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(a.TokenBoundaries))); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(bounds))); err != nil {
 		return nil, err
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, a.TokenBoundaries); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, bounds); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func encodeTokenBoundariesStageDelta(bounds []uint32) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(bounds))); err != nil {
+		return nil, err
+	}
+
+	if len(bounds) == 0 {
+		return buf.Bytes(), nil
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, bounds[0]); err != nil {
+		return nil, err
+	}
+
+	deltaBuf := make([]byte, 0, len(bounds)*2)
+	varintBuf := make([]byte, binary.MaxVarintLen64)
+	for i := 1; i < len(bounds); i++ {
+		if bounds[i] < bounds[i-1] {
+			return nil, fmt.Errorf("token boundaries not monotonic at index %d", i)
+		}
+		delta := bounds[i] - bounds[i-1]
+		n := binary.PutUvarint(varintBuf, uint64(delta))
+		deltaBuf = append(deltaBuf, varintBuf[:n]...)
+	}
+
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(deltaBuf))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(deltaBuf); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -599,6 +848,46 @@ func decodeCompressedDataStage(dst *Archive, params []byte, payload []byte) erro
 			return err
 		}
 		compressedData, err := decodeCompressedDataStage12(rawPayload)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth12
+		return nil
+	case stageCompressedDataParamWidth16Codebook:
+		compressedData, err := decodeCompressedDataStageCodebook(payload, tokenBitWidth16)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth16
+		return nil
+	case stageCompressedDataParamWidth16CodebookFlate:
+		rawPayload, err := decodeFlatePayload(payload)
+		if err != nil {
+			return err
+		}
+		compressedData, err := decodeCompressedDataStageCodebook(rawPayload, tokenBitWidth16)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth16
+		return nil
+	case stageCompressedDataParamWidth12Codebook:
+		compressedData, err := decodeCompressedDataStageCodebook(payload, tokenBitWidth12)
+		if err != nil {
+			return err
+		}
+		dst.CompressedData = compressedData
+		dst.compressedTokenBitWidth = tokenBitWidth12
+		return nil
+	case stageCompressedDataParamWidth12CodebookFlate:
+		rawPayload, err := decodeFlatePayload(payload)
+		if err != nil {
+			return err
+		}
+		compressedData, err := decodeCompressedDataStageCodebook(rawPayload, tokenBitWidth12)
 		if err != nil {
 			return err
 		}
@@ -699,7 +988,6 @@ func decodeStringBoundariesStage(dst *Archive, params []byte, payload []byte) er
 		return fmt.Errorf("string_boundaries payload too short: %d", len(payload))
 	}
 
-	const maxIntValue = uint64(^uint(0) >> 1)
 	r := bytes.NewReader(payload)
 	var boundariesLen uint32
 	if err := binary.Read(r, binary.LittleEndian, &boundariesLen); err != nil {
@@ -724,8 +1012,8 @@ func decodeStringBoundariesStage(dst *Archive, params []byte, payload []byte) er
 	if err := binary.Read(r, binary.LittleEndian, &firstBoundary); err != nil {
 		return err
 	}
-	if firstBoundary > maxIntValue {
-		return fmt.Errorf("first string boundary overflows int: %d", firstBoundary)
+	if firstBoundary > maxStringBoundaryValue {
+		return fmt.Errorf("first string boundary exceeds max supported value: %d", firstBoundary)
 	}
 
 	var deltaBufLen uint32
@@ -750,18 +1038,18 @@ func decodeStringBoundariesStage(dst *Archive, params []byte, payload []byte) er
 	boundaries := make([]int, boundariesLen)
 	boundaries[0] = int(firstBoundary)
 	offset := 0
-	prev := boundaries[0]
+	current := firstBoundary
 	for i := 1; i < len(boundaries); i++ {
 		delta, n := binary.Uvarint(deltaBuf[offset:])
 		if n <= 0 {
 			return fmt.Errorf("failed to decode boundary delta at index %d", i)
 		}
 		offset += n
-		if delta > maxIntValue-uint64(prev) {
-			return fmt.Errorf("boundary delta overflows int at index %d", i)
+		if delta > maxStringBoundaryValue-current {
+			return fmt.Errorf("boundary delta exceeds max supported value at index %d", i)
 		}
-		prev += int(delta)
-		boundaries[i] = prev
+		current += delta
+		boundaries[i] = int(current)
 	}
 	if offset != len(deltaBuf) {
 		return fmt.Errorf("unused bytes in boundary delta buffer: %d", len(deltaBuf)-offset)
@@ -803,35 +1091,124 @@ func decodeDictionaryStage(dst *Archive, params []byte, payload []byte) error {
 }
 
 func decodeTokenBoundariesStage(dst *Archive, params []byte, payload []byte) error {
-	if len(params) != 1 || params[0] != stageTokenBoundariesParamWidth {
+	if len(params) != 1 {
 		return fmt.Errorf("invalid token_boundaries params: %v", params)
 	}
+
+	switch params[0] {
+	case stageTokenBoundariesParamWidth:
+		tokenBoundaries, err := decodeTokenBoundariesStageRaw(payload)
+		if err != nil {
+			return err
+		}
+		dst.TokenBoundaries = tokenBoundaries
+		return nil
+	case stageTokenBoundariesParamDelta:
+		tokenBoundaries, err := decodeTokenBoundariesStageDelta(payload)
+		if err != nil {
+			return err
+		}
+		dst.TokenBoundaries = tokenBoundaries
+		return nil
+	default:
+		return fmt.Errorf("invalid token_boundaries params: %v", params)
+	}
+}
+
+func decodeTokenBoundariesStageRaw(payload []byte) ([]uint32, error) {
 	if len(payload) < 4 {
-		return fmt.Errorf("token_boundaries payload too short: %d", len(payload))
+		return nil, fmt.Errorf("token_boundaries payload too short: %d", len(payload))
 	}
 
 	r := bytes.NewReader(payload)
 	var tokenLen uint32
 	if err := binary.Read(r, binary.LittleEndian, &tokenLen); err != nil {
-		return err
+		return nil, err
 	}
 	if tokenLen > uint32(maxTokenBoundsRead) {
-		return fmt.Errorf("token boundary count too large: %d", tokenLen)
+		return nil, fmt.Errorf("token boundary count too large: %d", tokenLen)
 	}
 	expectedBytes := int(tokenLen) * 4
 	if r.Len() != expectedBytes {
-		return fmt.Errorf("token_boundaries length mismatch: payload=%d expected=%d", r.Len(), expectedBytes)
+		return nil, fmt.Errorf("token_boundaries length mismatch: payload=%d expected=%d", r.Len(), expectedBytes)
 	}
 
 	tokenBoundaries := make([]uint32, tokenLen)
 	if err := binary.Read(r, binary.LittleEndian, tokenBoundaries); err != nil {
-		return err
+		return nil, err
 	}
 	if r.Len() != 0 {
-		return fmt.Errorf("token_boundaries trailing bytes: %d", r.Len())
+		return nil, fmt.Errorf("token_boundaries trailing bytes: %d", r.Len())
 	}
-	dst.TokenBoundaries = tokenBoundaries
-	return nil
+	return tokenBoundaries, nil
+}
+
+func decodeTokenBoundariesStageDelta(payload []byte) ([]uint32, error) {
+	if len(payload) < 4 {
+		return nil, fmt.Errorf("token_boundaries payload too short: %d", len(payload))
+	}
+
+	r := bytes.NewReader(payload)
+	var tokenLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &tokenLen); err != nil {
+		return nil, err
+	}
+	if tokenLen > uint32(maxTokenBoundsRead) {
+		return nil, fmt.Errorf("token boundary count too large: %d", tokenLen)
+	}
+	if tokenLen == 0 {
+		if r.Len() != 0 {
+			return nil, fmt.Errorf("token_boundaries trailing bytes: %d", r.Len())
+		}
+		return nil, nil
+	}
+	if r.Len() < 8 {
+		return nil, fmt.Errorf("token_boundaries missing first boundary or delta length")
+	}
+
+	var firstBoundary uint32
+	if err := binary.Read(r, binary.LittleEndian, &firstBoundary); err != nil {
+		return nil, err
+	}
+
+	var deltaBufLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &deltaBufLen); err != nil {
+		return nil, err
+	}
+	if deltaBufLen > uint32(r.Len()) {
+		return nil, fmt.Errorf("delta buffer length %d exceeds remaining payload %d", deltaBufLen, r.Len())
+	}
+	if tokenLen-1 > deltaBufLen {
+		return nil, fmt.Errorf("delta buffer too short for %d boundaries: %d", tokenLen, deltaBufLen)
+	}
+
+	deltaBuf := make([]byte, deltaBufLen)
+	if _, err := io.ReadFull(r, deltaBuf); err != nil {
+		return nil, err
+	}
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("token_boundaries trailing bytes: %d", r.Len())
+	}
+
+	tokenBoundaries := make([]uint32, tokenLen)
+	tokenBoundaries[0] = firstBoundary
+	deltaOffset := 0
+	for i := 1; i < len(tokenBoundaries); i++ {
+		delta, n := binary.Uvarint(deltaBuf[deltaOffset:])
+		if n <= 0 {
+			return nil, fmt.Errorf("invalid token boundary delta at index %d", i)
+		}
+		next := uint64(tokenBoundaries[i-1]) + delta
+		if next > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("token boundary overflow at index %d", i)
+		}
+		tokenBoundaries[i] = uint32(next)
+		deltaOffset += n
+	}
+	if deltaOffset != len(deltaBuf) {
+		return nil, fmt.Errorf("token_boundaries delta trailing bytes: %d", len(deltaBuf)-deltaOffset)
+	}
+	return tokenBoundaries, nil
 }
 
 func validateArchiveStructure(a *Archive) error {
@@ -903,7 +1280,7 @@ func (a *Archive) WriteTo(w io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	tokenBoundariesPayload, err := encodeTokenBoundariesStage(a)
+	tokenBoundariesPayload, tokenBoundariesParam, err := encodeTokenBoundariesStage(a)
 	if err != nil {
 		return 0, err
 	}
@@ -930,7 +1307,7 @@ func (a *Archive) WriteTo(w io.Writer) (int64, error) {
 		},
 		{
 			name:    stageTokenBoundaries,
-			params:  []byte{stageTokenBoundariesParamWidth},
+			params:  []byte{tokenBoundariesParam},
 			payload: tokenBoundariesPayload,
 		},
 	}
