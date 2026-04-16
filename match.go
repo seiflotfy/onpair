@@ -28,11 +28,13 @@ const (
 // Matcher is a hybrid longest prefix matcher supporting arbitrary-length patterns.
 //
 // Combines direct hash lookup for short patterns with bucketed search for long patterns.
-// Optimized for OnPair's token discovery phase where most patterns are short but
-// long patterns provide significant compression benefits.
+// Both paths are gated by 2-byte-prefix filters so find() skips the Go map
+// lookup entirely when no stored pattern starts with those bytes.
 type Matcher struct {
 	longMatchBuckets map[uint64][]uint16  // 8-byte prefix → candidate token IDs
 	shortMatchLookup [9]map[uint64]uint16 // length → (prefix, token ID)
+	lengthByPrefix2  *[65536]uint8        // bit L set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2        *[1024]uint64        // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
 	dictionary       []byte               // Suffix storage for long patterns
 	endPositions     []uint32             // Boundary positions in dictionary
 	onPair16         bool
@@ -80,6 +82,12 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 		bucket = append(bucket, id)
 
+		if m.longBits2 == nil {
+			m.longBits2 = new([1024]uint64)
+		}
+		p2 := uint16(prefix)
+		m.longBits2[p2>>6] |= 1 << (p2 & 63)
+
 		// Sort by pattern length (longest first) for greedy matching
 		// Use insertion sort as we add one at a time
 		for i := len(bucket) - 1; i > 0; i-- {
@@ -109,6 +117,10 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 			m.shortMatchLookup[len(entry)] = lookup
 		}
 		lookup[prefix] = id
+		if m.lengthByPrefix2 == nil {
+			m.lengthByPrefix2 = new([65536]uint8)
+		}
+		m.lengthByPrefix2[uint16(prefix)] |= 1 << uint(len(entry))
 		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 	}
 	return true
@@ -122,66 +134,78 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 // 1. Long pattern search: Check bucketed patterns (>8 bytes) first for longest matches
 // 2. Short pattern search: Check direct lookup patterns (≤8 bytes) in decreasing length order
 func (m *Matcher) find(data []byte) (uint16, int, bool) {
-	// Phase 1: Long pattern search (>8 bytes) - check longest matches first
-	if len(data) > minMatch {
+	// Phase 1: Long pattern search (>8 bytes) - check longest matches first.
+	// Gate map access behind a 2-byte-prefix bitset so non-matching inputs
+	// skip the Go map lookup entirely.
+	if len(data) > minMatch && m.longBits2 != nil {
 		prefix := bytesToU64LE(data, minMatch)
-		inputSuffix := data[minMatch:]
-		inputPacked := uint64(0)
-		inputPackedLen := len(inputSuffix)
-		if inputPackedLen > minMatch {
-			inputPackedLen = minMatch
-		}
-		if m.onPair16 {
-			inputPacked = bytesToU64LE(inputSuffix, inputPackedLen)
-		}
+		p2 := uint16(prefix)
+		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
+			inputSuffix := data[minMatch:]
+			inputPacked := uint64(0)
+			inputPackedLen := len(inputSuffix)
+			if inputPackedLen > minMatch {
+				inputPackedLen = minMatch
+			}
+			if m.onPair16 {
+				inputPacked = bytesToU64LE(inputSuffix, inputPackedLen)
+			}
 
-		if bucket, ok := m.longMatchBuckets[prefix]; ok {
-			for _, id := range bucket {
-				// Bounds check: ensure we don't access beyond endPositions array
-				// This can happen when we've filled all 65536 token slots
-				if int(id)+1 >= len(m.endPositions) {
-					continue
-				}
-
-				dictStart := int(m.endPositions[id])
-				dictEnd := int(m.endPositions[id+1])
-
-				// Additional safety check for dictionary bounds
-				if dictStart < 0 || dictEnd > len(m.dictionary) || dictStart > dictEnd {
-					continue
-				}
-
-				length := dictEnd - dictStart
-
-				// Verify suffix matches beyond the 8-byte prefix
-				if len(inputSuffix) >= length {
-					suffix := m.dictionary[dictStart:dictEnd]
-					if m.onPair16 && length <= minMatch {
-						if hasPackedPrefix(inputPacked, bytesToU64LE(suffix, length), length) {
-							return id, minMatch + length, true
-						}
+			if bucket, ok := m.longMatchBuckets[prefix]; ok {
+				for _, id := range bucket {
+					// Bounds check: ensure we don't access beyond endPositions array
+					// This can happen when we've filled all 65536 token slots
+					if int(id)+1 >= len(m.endPositions) {
 						continue
 					}
-					if bytes.HasPrefix(inputSuffix, suffix) {
-						return id, minMatch + length, true
+
+					dictStart := int(m.endPositions[id])
+					dictEnd := int(m.endPositions[id+1])
+
+					// Additional safety check for dictionary bounds
+					if dictStart < 0 || dictEnd > len(m.dictionary) || dictStart > dictEnd {
+						continue
+					}
+
+					length := dictEnd - dictStart
+
+					// Verify suffix matches beyond the 8-byte prefix
+					if len(inputSuffix) >= length {
+						suffix := m.dictionary[dictStart:dictEnd]
+						if m.onPair16 && length <= minMatch {
+							if hasPackedPrefix(inputPacked, bytesToU64LE(suffix, length), length) {
+								return id, minMatch + length, true
+							}
+							continue
+						}
+						if bytes.HasPrefix(inputSuffix, suffix) {
+							return id, minMatch + length, true
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// Phase 2: Short pattern search (≤8 bytes) - longest to shortest
+	// Phase 2: Short pattern search (≤8 bytes) - longest to shortest.
+	// Use 2-byte-prefix bitmask to skip lengths with no candidates.
 	maxLen := minMatch
 	if len(data) < maxLen {
 		maxLen = len(data)
 	}
 
-	// Compute prefix once at max length, then mask down per iteration
-	prefix := bytesToU64LE(data, maxLen)
-	for length := maxLen; length >= 2; length-- {
-		maskedPrefix := prefix & masks[length]
-		if id, ok := m.shortMatchLookup[length][maskedPrefix]; ok {
-			return id, length, true
+	if maxLen >= 2 && m.lengthByPrefix2 != nil {
+		prefix := bytesToU64LE(data, maxLen)
+		lenMask := m.lengthByPrefix2[uint16(prefix)]
+		// Drop bits for lengths > maxLen. maxLen ≤ 8 so mask fits in uint8.
+		lenMask &= (1 << (uint(maxLen) + 1)) - 1
+		for lenMask != 0 {
+			length := bits.Len8(lenMask) - 1
+			maskedPrefix := prefix & masks[length]
+			if id, ok := m.shortMatchLookup[length][maskedPrefix]; ok {
+				return id, length, true
+			}
+			lenMask &^= 1 << length
 		}
 	}
 	if len(data) > 0 {

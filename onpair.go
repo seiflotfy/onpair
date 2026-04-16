@@ -578,7 +578,20 @@ func (e *Encoder) buildTokens(
 	}
 
 	nextTokenID := uint16(singleByteTokens)
-	frequency := make(map[uint32]uint16, 4096)
+	// Pre-size the pair-frequency counter from the sampled byte count.
+	// Roughly 1 pair per ~3 bytes of sampled data (empirical), capped.
+	sampleBytes := 0
+	for _, idx := range shuffledIndices {
+		sampleBytes += endPositions[idx+1] - endPositions[idx]
+	}
+	freqHint := sampleBytes / 3
+	if freqHint < 4096 {
+		freqHint = 4096
+	}
+	if freqHint > 1<<20 {
+		freqHint = 1 << 20
+	}
+	frequency := newPairCounter(freqHint)
 	maxTokenLen := e.config.MaxTokenLen
 
 	// State machine variables
@@ -647,15 +660,15 @@ func (e *Encoder) buildTokens(
 
 		// Count pair and check for merge
 		pair := uint32(prevTokenID)<<16 | uint32(currTokenID)
-		frequency[pair]++
+		cnt := frequency.incr(pair)
 
-		if frequency[pair] >= threshold {
+		if cnt >= threshold {
 			if nextTokenID > limitTokenID {
 				return dictionary, tokenBoundaries
 			}
 			mergedToken := data[pos-prevLength : pos+currLength]
 			if !matcher.insert(mergedToken, nextTokenID) {
-				delete(frequency, pair)
+				frequency.remove(pair)
 				prevTokenID = currTokenID
 				prevLength = currLength
 				pos += currLength
@@ -664,7 +677,7 @@ func (e *Encoder) buildTokens(
 			dictionary = append(dictionary, mergedToken...)
 			tokenBoundaries = append(tokenBoundaries, uint32(len(dictionary)))
 
-			delete(frequency, pair)
+			frequency.remove(pair)
 			prevTokenID = nextTokenID
 			prevLength = len(mergedToken)
 
