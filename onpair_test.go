@@ -516,7 +516,7 @@ func TestOnPair16MatcherBucketBound(t *testing.T) {
 	if inserted != maxOnPair16BucketSize {
 		t.Fatalf("inserted long-token count mismatch: got %d want %d", inserted, maxOnPair16BucketSize)
 	}
-	if got := len(m.longMatchBuckets[prefixKey]); got != maxOnPair16BucketSize {
+	if got := m.longMatchBuckets.get(prefixKey).len(); got != maxOnPair16BucketSize {
 		t.Fatalf("bucket size mismatch: got %d want %d", got, maxOnPair16BucketSize)
 	}
 }

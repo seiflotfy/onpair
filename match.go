@@ -31,14 +31,42 @@ const (
 // Both paths are gated by 2-byte-prefix filters so find() skips the Go map
 // lookup entirely when no stored pattern starts with those bytes.
 type Matcher struct {
-	longMatchBuckets map[uint64][]uint16  // 8-byte prefix → candidate token IDs
-	shortMatchLookup [9]map[uint64]uint16 // length → (prefix, token ID)
-	lengthByPrefix2  *[65536]uint8        // bit L set ⇒ some short token of length L starts with these 2 LE bytes
-	longBits2        *[1024]uint64        // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
-	dictionary       []byte               // Suffix storage for long patterns
-	endPositions     []uint32             // Boundary positions in dictionary
+	longMatchBuckets longBucketTable   // 8-byte prefix → candidate bucket (sorted desc by suffix length)
+	shortMatchLookup [9]u64U16Table    // length → (prefix, token ID)
+	lengthByPrefix2  *[65536]uint8     // bit L set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2        *[1024]uint64     // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
+	dictionary       []byte            // Suffix storage for long patterns
+	endPositions     []uint32          // Boundary positions in dictionary
 	onPair16         bool
 	bucketSizeLimit  int
+}
+
+// longBucket is a struct-of-arrays layout. heads + suffixLens are the hot
+// arrays touched on every probe (reject path); ids + dictStarts are cold,
+// read only when the packed head matches and the suffix exceeds 8 bytes.
+// Keeping them in parallel slices cuts the reject-path working set from
+// 16 B/entry (the equivalent AoS struct) to 10 B/entry.
+type longBucket struct {
+	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
+	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
+	ids        []uint16
+	dictStarts []uint32 // offset in m.dictionary where this suffix starts
+}
+
+func (b *longBucket) len() int { return len(b.heads) }
+
+func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
+	b.heads = append(b.heads, head)
+	b.suffixLens = append(b.suffixLens, suffixLen)
+	b.ids = append(b.ids, id)
+	b.dictStarts = append(b.dictStarts, dictStart)
+}
+
+func (b *longBucket) swap(i, j int) {
+	b.heads[i], b.heads[j] = b.heads[j], b.heads[i]
+	b.suffixLens[i], b.suffixLens[j] = b.suffixLens[j], b.suffixLens[i]
+	b.ids[i], b.ids[j] = b.ids[j], b.ids[i]
+	b.dictStarts[i], b.dictStarts[j] = b.dictStarts[j], b.dictStarts[i]
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -70,17 +98,27 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 	if len(entry) > minMatch {
 		// Long pattern: store 8-byte prefix in bucket, suffix in dictionary
 		prefix := bytesToU64LE(entry, minMatch)
-		if m.longMatchBuckets == nil {
-			m.longMatchBuckets = make(map[uint64][]uint16)
-		}
-		bucket := m.longMatchBuckets[prefix]
-		if m.bucketSizeLimit > 0 && len(bucket) >= m.bucketSizeLimit {
+		bucket := m.longMatchBuckets.get(prefix)
+		if bucket != nil && m.bucketSizeLimit > 0 && bucket.len() >= m.bucketSizeLimit {
 			return false
 		}
+		if bucket == nil {
+			bucket = &longBucket{}
+			m.longMatchBuckets.set(prefix, bucket)
+		}
 
-		m.dictionary = append(m.dictionary, entry[minMatch:]...)
+		suffix := entry[minMatch:]
+		suffixLen := len(suffix)
+		headLen := suffixLen
+		if headLen > minMatch {
+			headLen = minMatch
+		}
+		head := bytesToU64LE(suffix, headLen)
+		dictStart := uint32(len(m.dictionary))
+
+		m.dictionary = append(m.dictionary, suffix...)
 		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
-		bucket = append(bucket, id)
+		bucket.appendEntry(head, uint16(suffixLen), id, dictStart)
 
 		if m.longBits2 == nil {
 			m.longBits2 = new([1024]uint64)
@@ -88,20 +126,15 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 		p2 := uint16(prefix)
 		m.longBits2[p2>>6] |= 1 << (p2 & 63)
 
-		// Sort by pattern length (longest first) for greedy matching
-		// Use insertion sort as we add one at a time
-		for i := len(bucket) - 1; i > 0; i-- {
-			id1 := bucket[i]
-			id2 := bucket[i-1]
-			len1 := int(m.endPositions[id1+1]) - int(m.endPositions[id1])
-			len2 := int(m.endPositions[id2+1]) - int(m.endPositions[id2])
-			if len1 > len2 {
-				bucket[i], bucket[i-1] = bucket[i-1], bucket[i]
+		// Sort by suffix length (longest first) for greedy matching.
+		// Insertion sort as we add one at a time.
+		for i := bucket.len() - 1; i > 0; i-- {
+			if bucket.suffixLens[i] > bucket.suffixLens[i-1] {
+				bucket.swap(i, i-1)
 			} else {
 				break
 			}
 		}
-		m.longMatchBuckets[prefix] = bucket
 	} else {
 		// Single-byte tokens are always byte-value identity tokens.
 		if len(entry) == 1 {
@@ -111,12 +144,7 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 
 		// Short pattern: direct hash table lookup
 		prefix := bytesToU64LE(entry, len(entry))
-		lookup := m.shortMatchLookup[len(entry)]
-		if lookup == nil {
-			lookup = make(map[uint64]uint16)
-			m.shortMatchLookup[len(entry)] = lookup
-		}
-		lookup[prefix] = id
+		m.shortMatchLookup[len(entry)].set(prefix, id)
 		if m.lengthByPrefix2 == nil {
 			m.lengthByPrefix2 = new([65536]uint8)
 		}
@@ -142,45 +170,37 @@ func (m *Matcher) find(data []byte) (uint16, int, bool) {
 		p2 := uint16(prefix)
 		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
 			inputSuffix := data[minMatch:]
-			inputPacked := uint64(0)
-			inputPackedLen := len(inputSuffix)
-			if inputPackedLen > minMatch {
-				inputPackedLen = minMatch
+			inputHeadLen := len(inputSuffix)
+			if inputHeadLen > minMatch {
+				inputHeadLen = minMatch
 			}
-			if m.onPair16 {
-				inputPacked = bytesToU64LE(inputSuffix, inputPackedLen)
-			}
+			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
-			if bucket, ok := m.longMatchBuckets[prefix]; ok {
-				for _, id := range bucket {
-					// Bounds check: ensure we don't access beyond endPositions array
-					// This can happen when we've filled all 65536 token slots
-					if int(id)+1 >= len(m.endPositions) {
+			if bucket := m.longMatchBuckets.get(prefix); bucket != nil {
+				heads := bucket.heads
+				lens := bucket.suffixLens
+				for i := 0; i < len(heads); i++ {
+					sLen := int(lens[i])
+					if sLen > len(inputSuffix) {
 						continue
 					}
-
-					dictStart := int(m.endPositions[id])
-					dictEnd := int(m.endPositions[id+1])
-
-					// Additional safety check for dictionary bounds
-					if dictStart < 0 || dictEnd > len(m.dictionary) || dictStart > dictEnd {
+					// Packed head prefilter: XOR the stored head with the input's
+					// head masked to the relevant length. For suffixes ≤ 8 bytes
+					// this is authoritative; otherwise it's a cheap reject.
+					mLen := sLen
+					if mLen > minMatch {
+						mLen = minMatch
+					}
+					if (heads[i]^inputHead)&masks[mLen] != 0 {
 						continue
 					}
-
-					length := dictEnd - dictStart
-
-					// Verify suffix matches beyond the 8-byte prefix
-					if len(inputSuffix) >= length {
-						suffix := m.dictionary[dictStart:dictEnd]
-						if m.onPair16 && length <= minMatch {
-							if hasPackedPrefix(inputPacked, bytesToU64LE(suffix, length), length) {
-								return id, minMatch + length, true
-							}
-							continue
-						}
-						if bytes.HasPrefix(inputSuffix, suffix) {
-							return id, minMatch + length, true
-						}
+					if sLen <= minMatch {
+						return bucket.ids[i], minMatch + sLen, true
+					}
+					// Suffix longer than 8 bytes: verify the tail past the head.
+					start := int(bucket.dictStarts[i])
+					if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+						return bucket.ids[i], minMatch + sLen, true
 					}
 				}
 			}
@@ -202,7 +222,7 @@ func (m *Matcher) find(data []byte) (uint16, int, bool) {
 		for lenMask != 0 {
 			length := bits.Len8(lenMask) - 1
 			maskedPrefix := prefix & masks[length]
-			if id, ok := m.shortMatchLookup[length][maskedPrefix]; ok {
+			if id, ok := m.shortMatchLookup[length].get(maskedPrefix); ok {
 				return id, length, true
 			}
 			lenMask &^= 1 << length
@@ -213,21 +233,6 @@ func (m *Matcher) find(data []byte) (uint16, int, bool) {
 	}
 
 	return 0, 0, false
-}
-
-func hasPackedPrefix(inputPacked, tokenPacked uint64, tokenLen int) bool {
-	if tokenLen <= 0 {
-		return true
-	}
-	if tokenLen > minMatch {
-		return false
-	}
-
-	diff := inputPacked ^ tokenPacked
-	if diff == 0 {
-		return true
-	}
-	return bits.TrailingZeros64(diff)/8 >= tokenLen
 }
 
 // bytesToU64LE converts byte sequence to little-endian u64 with length masking.
