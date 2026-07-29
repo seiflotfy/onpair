@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1808,4 +1809,36 @@ func BenchmarkThreshold(b *testing.B) {
 		}
 		b.ReportMetric(float64(len(data))/float64(a.SpaceUsed()), "ratio")
 	})
+}
+
+func TestCompressParallelMatchesSerial(t *testing.T) {
+	lines, err := loadTestDataLines("testdata/logs_apache_2k.log")
+	if err != nil {
+		t.Skipf("testdata unavailable: %v", err)
+	}
+	// Repeat the corpus past parallelEncodeMinBytes, mixing in empty rows.
+	rows := make([]string, 0, len(lines)*8+16)
+	for i := range 8 {
+		rows = append(rows, lines...)
+		rows = append(rows, "", lines[i])
+	}
+	model, err := TrainModel(rows)
+	if err != nil {
+		t.Fatalf("TrainModel failed: %v", err)
+	}
+
+	enc := &Encoder{config: model.config}
+	data, endPositions := flattenStrings(rows)
+	if len(data) < parallelEncodeMinBytes {
+		t.Fatalf("corpus too small to exercise the parallel path: %d bytes", len(data))
+	}
+	serialCodes, serialBounds := enc.compressRange(data, endPositions, 0, len(rows), model.matcher)
+	parCodes, parBounds := enc.compressParallel(data, endPositions, model.matcher, 8)
+
+	if !slices.Equal(serialCodes, parCodes) {
+		t.Fatal("parallel codes differ from serial")
+	}
+	if !slices.Equal(serialBounds, parBounds) {
+		t.Fatal("parallel boundaries differ from serial")
+	}
 }

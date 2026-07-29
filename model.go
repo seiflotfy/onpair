@@ -4,7 +4,6 @@ package onpair
 type Model struct {
 	config          Config
 	matcher         *matcher
-	codeRemap       []uint16 // creation-order token id → sorted dictionary id
 	dictionary      []byte
 	tokenBoundaries []uint32
 }
@@ -31,9 +30,8 @@ func TrainModel(strings []string, opts ...Option) (*Model, error) {
 func (m *Model) Train(strings []string) error {
 	enc := &Encoder{config: m.config}
 	data, endPositions := flattenStrings(strings)
-	matcher, dict, tokenBoundaries, remap := enc.train(data, endPositions)
+	matcher, dict, tokenBoundaries := enc.train(data, endPositions)
 	m.matcher = matcher
-	m.codeRemap = remap
 	m.dictionary = dict
 	m.tokenBoundaries = tokenBoundaries
 	return nil
@@ -46,7 +44,7 @@ func (m *Model) Encode(strings []string) (*Archive, error) {
 	}
 	enc := &Encoder{config: m.config}
 	data, endPositions := flattenStrings(strings)
-	compressedData, stringBoundaries := enc.compress(data, endPositions, m.matcher, m.codeRemap)
+	compressedData, stringBoundaries := enc.compress(data, endPositions, m.matcher)
 
 	tokenBoundaries := append([]uint32(nil), m.tokenBoundaries...)
 	return &Archive{
@@ -68,10 +66,10 @@ func (e *Encoder) Encode(strings []string) (*Archive, error) {
 	data, endPositions := flattenStrings(strings)
 
 	// Train the dictionary
-	matcher, dict, tokenBoundaries, remap := e.train(data, endPositions)
+	matcher, dict, tokenBoundaries := e.train(data, endPositions)
 
 	// Compress the data
-	compressedData, stringBoundaries := e.compress(data, endPositions, matcher, remap)
+	compressedData, stringBoundaries := e.compress(data, endPositions, matcher)
 
 	return &Archive{
 		CompressedData:          compressedData,

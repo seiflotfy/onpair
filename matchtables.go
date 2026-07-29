@@ -115,11 +115,13 @@ func (t *u64U16Table) reserve() {
 	t.mask = initialSize - 1
 }
 
-func (t *u64U16Table) get(key uint64) (uint16, bool) {
+// getHashed looks up key with the caller supplying hashU64(key), letting hot
+// loops share one hash between a bloom check and the probe.
+func (t *u64U16Table) getHashed(key, hash uint64) (uint16, bool) {
 	if t.entries == nil {
 		return 0, false
 	}
-	h := hashU64(key) & t.mask
+	h := hash & t.mask
 	for {
 		e := &t.entries[h]
 		if e.value == 0 {
@@ -181,6 +183,81 @@ func (t *u64U16Table) reinsert(key uint64, value uint16) {
 			return
 		}
 		h = (h + 1) & t.mask
+	}
+}
+
+// u64U16PackedTable maps a uint64 key that uses at most 48 low bits to a
+// uint16 value packed into the slot's top 16 bits. One uint64 per slot means
+// eight entries per cache line versus four for u64U16Table, halving the probe
+// working set. Slot 0 marks empty, which is safe because value 0 (token IDs
+// 0-255 are single-byte and bypass this table) is never stored.
+type u64U16PackedTable struct {
+	slots []uint64
+	mask  uint64
+	count int
+}
+
+const packedKeyMask = 0x0000FFFFFFFFFFFF // low 48 bits hold the key
+
+// getHashed looks up key with the caller supplying hashU64(key), letting hot
+// loops share one hash between a bloom check and the probe.
+func (t *u64U16PackedTable) getHashed(key, hash uint64) (uint16, bool) {
+	if t.slots == nil {
+		return 0, false
+	}
+	h := hash & t.mask
+	for {
+		s := t.slots[h]
+		if s == 0 {
+			return 0, false
+		}
+		if s&packedKeyMask == key {
+			return uint16(s >> 48), true
+		}
+		h = (h + 1) & t.mask
+	}
+}
+
+func (t *u64U16PackedTable) set(key uint64, value uint16) {
+	if t.slots == nil {
+		const initialSize = 16
+		t.slots = make([]uint64, initialSize)
+		t.mask = initialSize - 1
+	}
+	if (t.count+1)*2 >= len(t.slots) {
+		t.grow()
+	}
+	packed := key | uint64(value)<<48
+	h := hashU64(key) & t.mask
+	for {
+		s := t.slots[h]
+		if s == 0 {
+			t.slots[h] = packed
+			t.count++
+			return
+		}
+		if s&packedKeyMask == key {
+			t.slots[h] = packed
+			return
+		}
+		h = (h + 1) & t.mask
+	}
+}
+
+func (t *u64U16PackedTable) grow() {
+	old := t.slots
+	size := uint64(len(old)) * 2
+	t.slots = make([]uint64, size)
+	t.mask = size - 1
+	for _, s := range old {
+		if s == 0 {
+			continue
+		}
+		h := hashU64(s&packedKeyMask) & t.mask
+		for t.slots[h] != 0 {
+			h = (h + 1) & t.mask
+		}
+		t.slots[h] = s
 	}
 }
 

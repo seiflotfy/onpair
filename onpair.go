@@ -5,7 +5,9 @@ import (
 	"cmp"
 	"errors"
 	"math/bits"
+	"runtime"
 	"slices"
+	"sync"
 )
 
 const (
@@ -113,12 +115,13 @@ const (
 
 // train builds the dictionary in creation order, then sorts it into strict
 // bytewise-lexicographic order — the property compressed-domain search binary-
-// searches over. The matcher keeps creation-order ids; remap translates them
-// to sorted ids at compress time.
-func (e *Encoder) train(data []byte, endPositions []int) (*matcher, []byte, []uint32, []uint16) {
+// searches over. The matcher's stored ids are rewritten to sorted order, so
+// find returns final ids and compress needs no translation step.
+func (e *Encoder) train(data []byte, endPositions []int) (*matcher, []byte, []uint32) {
 	matcher, dictionary, tokenBoundaries := e.trainUnsorted(data, endPositions)
 	dictionary, tokenBoundaries, remap := sortDictionary(dictionary, tokenBoundaries)
-	return matcher, dictionary, tokenBoundaries, remap
+	matcher.applyRemap(remap)
+	return matcher, dictionary, tokenBoundaries
 }
 
 // sortDictionary reorders tokens into strict bytewise-lexicographic order,
@@ -629,14 +632,33 @@ func (e *Encoder) buildTokens(
 	return dictionary, tokenBoundaries
 }
 
-// compress parses the data using the trained matcher, emitting sorted token
-// ids via remap (the matcher works in creation-order ids).
-func (e *Encoder) compress(data []byte, endPositions []int, matcher *matcher, remap []uint16) ([]uint16, []int) {
-	compressedData := make([]uint16, 0, len(data)/2)
-	stringBoundaries := make([]int, 0, len(endPositions))
+// Parallel encode kicks in above these sizes; below them goroutine and
+// stitch overhead beats the win. Rows parse independently against the shared
+// read-only matcher, so output is byte-identical to the serial path.
+const (
+	parallelEncodeMinBytes   = 1 << 20
+	parallelEncodeShardBytes = 256 << 10
+)
+
+// compress parses the data using the trained matcher, which emits sorted
+// token ids directly (train rewrites its stored ids after sorting).
+func (e *Encoder) compress(data []byte, endPositions []int, matcher *matcher) ([]uint16, []int) {
+	if len(data) >= parallelEncodeMinBytes {
+		if shards := min(runtime.GOMAXPROCS(0), len(data)/parallelEncodeShardBytes); shards > 1 {
+			return e.compressParallel(data, endPositions, matcher, shards)
+		}
+	}
+	return e.compressRange(data, endPositions, 0, len(endPositions)-1, matcher)
+}
+
+// compressRange parses rows [loRow, hiRow), returning their codes and
+// range-relative string boundaries (leading 0, one entry per row).
+func (e *Encoder) compressRange(data []byte, endPositions []int, loRow, hiRow int, matcher *matcher) ([]uint16, []int) {
+	compressedData := make([]uint16, 0, (endPositions[hiRow]-endPositions[loRow])/2)
+	stringBoundaries := make([]int, 0, hiRow-loRow+1)
 	stringBoundaries = append(stringBoundaries, 0)
 
-	for i := 0; i < len(endPositions)-1; i++ {
+	for i := loRow; i < hiRow; i++ {
 		start := endPositions[i]
 		end := endPositions[i+1]
 
@@ -652,10 +674,61 @@ func (e *Encoder) compress(data []byte, endPositions []int, matcher *matcher, re
 				// Should not happen if single byte tokens are present
 				break
 			}
-			compressedData = append(compressedData, remap[tokenID])
+			compressedData = append(compressedData, tokenID)
 			pos += length
 		}
 		stringBoundaries = append(stringBoundaries, len(compressedData))
+	}
+	return compressedData, stringBoundaries
+}
+
+// compressParallel splits the rows into byte-balanced shards, parses them
+// concurrently against the shared matcher, and stitches the results in shard
+// order.
+func (e *Encoder) compressParallel(data []byte, endPositions []int, matcher *matcher, shards int) ([]uint16, []int) {
+	numRows := len(endPositions) - 1
+	cuts := make([]int, shards+1)
+	cuts[shards] = numRows
+	for s := 1; s < shards; s++ {
+		target := endPositions[0] + (endPositions[numRows]-endPositions[0])/shards*s
+		row, _ := slices.BinarySearch(endPositions, target)
+		cuts[s] = max(cuts[s-1], min(row, numRows))
+	}
+
+	type shardResult struct {
+		codes  []uint16
+		bounds []int
+	}
+	results := make([]shardResult, shards)
+	var wg sync.WaitGroup
+	for s := range shards {
+		if cuts[s] == cuts[s+1] {
+			continue
+		}
+		wg.Add(1)
+		go func(s int) {
+			defer wg.Done()
+			codes, bounds := e.compressRange(data, endPositions, cuts[s], cuts[s+1], matcher)
+			results[s] = shardResult{codes: codes, bounds: bounds}
+		}(s)
+	}
+	wg.Wait()
+
+	totalCodes := 0
+	for s := range results {
+		totalCodes += len(results[s].codes)
+	}
+	compressedData := make([]uint16, 0, totalCodes)
+	stringBoundaries := make([]int, 1, numRows+1)
+	for s := range results {
+		if len(results[s].bounds) == 0 {
+			continue
+		}
+		base := len(compressedData)
+		compressedData = append(compressedData, results[s].codes...)
+		for _, b := range results[s].bounds[1:] {
+			stringBoundaries = append(stringBoundaries, base+b)
+		}
 	}
 	return compressedData, stringBoundaries
 }
