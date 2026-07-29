@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 )
 
 // ErrDictionaryNotSearchable reports an archive whose dictionary does not meet
@@ -37,6 +38,7 @@ type Searcher struct {
 	archive     *Archive
 	numTokens   int
 	maxTokenLen int
+	builders    sync.Pool // *containsBuilder scratch reused across RowsContaining calls
 }
 
 // Searcher validates the archive for compressed-domain search.
@@ -269,12 +271,20 @@ func (s *Searcher) RowsContaining(pattern []byte) ([]int, error) {
 	if len(pattern) > math.MaxUint16 {
 		return nil, fmt.Errorf("pattern length %d exceeds %d", len(pattern), math.MaxUint16)
 	}
-	table := s.newContainsTable(pattern)
+	var table containsTable
+	var b *containsBuilder
+	if len(pattern) > 0 {
+		b = s.newContainsBuilder(pattern)
+		table = containsTable{accept: uint16(len(pattern)), base: b.base, sparse: b.sparse, offsets: b.offsets}
+	}
 	var hits []int
 	for k := 0; k < s.archive.Rows(); k++ {
 		if table.matches(s.searchRowCodes(k)) {
 			hits = append(hits, k)
 		}
+	}
+	if b != nil {
+		s.builders.Put(b)
 	}
 	return hits, nil
 }
@@ -330,24 +340,49 @@ func (t *containsTable) matches(codes []uint16) bool {
 	return false
 }
 
-func (s *Searcher) newContainsTable(pattern []byte) containsTable {
+// newContainsBuilder builds the transition tables for a non-empty pattern,
+// reusing pooled scratch from earlier queries on this Searcher. The caller
+// returns the builder to s.builders once it is done with the tables.
+func (s *Searcher) newContainsBuilder(pattern []byte) *containsBuilder {
+	b, _ := s.builders.Get().(*containsBuilder)
+	if b == nil {
+		b = &containsBuilder{}
+	}
 	m := len(pattern)
-	if m == 0 {
-		return containsTable{}
-	}
-	b := containsBuilder{
-		s:       s,
-		p:       pattern,
-		fail:    kmpFailure(pattern),
-		base:    make([]uint16, s.numTokens),
-		offsets: make([]uint32, m+1),
-	}
+	b.s = s
+	b.p = pattern
+	b.fail = kmpFailure(pattern, b.fail)
+	b.base = resizeCleared(b.base, s.numTokens)
+	b.offsets = resizeSlice(b.offsets, m+1) // every entry but [0] is written below
+	b.offsets[0] = 0
+	b.sparse = b.sparse[:0]
 	if m <= dfaMaxPattern {
 		b.buildDFA()
+	} else {
+		b.dfa = nil // stepByte falls back to failure-chain walking
 	}
 	b.basePass()
 	b.sparsePass()
-	return containsTable{accept: uint16(m), base: b.base, sparse: b.sparse, offsets: b.offsets}
+	return b
+}
+
+// resizeSlice returns s with length n, reallocating only when cap(s) < n.
+// Contents are unspecified.
+func resizeSlice[E any](s []E, n int) []E {
+	if cap(s) < n {
+		return make([]E, n)
+	}
+	return s[:n]
+}
+
+// resizeCleared is resizeSlice with the result zeroed.
+func resizeCleared[E any](s []E, n int) []E {
+	if cap(s) < n {
+		return make([]E, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
 }
 
 // containsBuilder is the scratch state for building a containsTable; the
@@ -373,7 +408,8 @@ const dfaMaxPattern = 256
 // one load. Rows are [256]uint16 arrays so byte indexing needs no bounds check.
 func (b *containsBuilder) buildDFA() {
 	m := len(b.p)
-	dfa := make([][256]uint16, m+1)
+	dfa := resizeSlice(b.dfa, m+1)
+	clear(dfa[0][:]) // rows 1..m are fully overwritten below
 	dfa[0][b.p[0]] = 1
 	x := 0 // the state the failure link mirrors
 	for s := 1; s <= m; s++ {
@@ -390,9 +426,10 @@ func (b *containsBuilder) buildDFA() {
 }
 
 // kmpFailure is the byte-level KMP failure table: fail[i] is the length of the
-// longest proper prefix of p[:i+1] that is also a suffix.
-func kmpFailure(p []byte) []uint16 {
-	fail := make([]uint16, len(p))
+// longest proper prefix of p[:i+1] that is also a suffix. scratch is reused
+// when large enough.
+func kmpFailure(p []byte, scratch []uint16) []uint16 {
+	fail := resizeCleared(scratch, len(p))
 	length := 0
 	for i := 1; i < len(p); {
 		switch {
@@ -443,8 +480,10 @@ func (b *containsBuilder) stepBytes(st uint16, data []byte) uint16 {
 // basePass fills base[t] with the state reached by running token t's bytes
 // from state 0. Cost is one serial DFA step per dictionary byte past each
 // token's first pattern-byte occurrence.
-// ponytail: dependent-load bound; interleave several tokens' walks if a
-// profile ever shows table build dominating a real workload.
+// ponytail: dependent-load bound. Carrying states across sorted-neighbor
+// common prefixes measured slower (the lcp compare outweighs the skipped
+// steps); interleaving several tokens' walks for ILP is the remaining upgrade
+// if table build ever dominates a real workload.
 func (b *containsBuilder) basePass() {
 	p0 := b.p[0]
 	for t := range b.base {

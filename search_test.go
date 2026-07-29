@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -332,4 +333,46 @@ func FuzzSearcher(f *testing.F) {
 			t.Errorf("RowsContaining(%q) = %v, want %v", needle, got, wantSub)
 		}
 	})
+}
+
+func TestRowsContainingConcurrent(t *testing.T) {
+	lines, err := loadTestDataLines("testdata/logs_apache_2k.log")
+	if err != nil {
+		t.Skipf("testdata unavailable: %v", err)
+	}
+	archive := mustEncode(NewEncoder(), lines)
+	s, err := archive.Searcher()
+	if err != nil {
+		t.Fatalf("Searcher failed: %v", err)
+	}
+	patterns := [][]byte{
+		[]byte("error"), []byte("jk2_init"), []byte("mod_"), []byte("workerEnv"),
+		[]byte(" "), []byte("["), []byte("no such pattern anywhere"), []byte("OK"),
+	}
+	want := make([][]int, len(patterns))
+	for i, p := range patterns {
+		if want[i], err = s.RowsContaining(p); err != nil {
+			t.Fatalf("RowsContaining(%q): %v", p, err)
+		}
+	}
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for iter := range 50 {
+				i := (g + iter) % len(patterns)
+				got, err := s.RowsContaining(patterns[i])
+				if err != nil {
+					t.Errorf("RowsContaining(%q): %v", patterns[i], err)
+					return
+				}
+				if !slices.Equal(got, want[i]) {
+					t.Errorf("RowsContaining(%q) diverged under concurrency", patterns[i])
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
