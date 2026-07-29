@@ -192,6 +192,9 @@ _ = out
 - `WithTokenBitWidth(bits uint8) Option` (`12` or `16`, default `16`)
 - `WithTrainingSampleBytes(n int) Option` (default `1 MiB`)
 - `WithTemplateStratifiedSampling(maxClusters int) Option`
+- `WithParallelism(n int) Option` (compress with up to `n` goroutines on
+  inputs over ~1 MiB; byte-identical output, `n <= 0` means `GOMAXPROCS`.
+  Encoding is single-goroutine unless this is set)
 
 ### Encode/decode
 

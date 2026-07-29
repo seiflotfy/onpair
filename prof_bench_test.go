@@ -43,7 +43,7 @@ func BenchmarkProfCompressParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	enc := &Encoder{config: model.config}
+	enc := NewEncoder(WithParallelism(0))
 	data, endPositions := flattenStrings(lines)
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()

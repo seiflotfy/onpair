@@ -1841,4 +1841,16 @@ func TestCompressParallelMatchesSerial(t *testing.T) {
 	if !slices.Equal(serialBounds, parBounds) {
 		t.Fatal("parallel boundaries differ from serial")
 	}
+
+	// Parallelism is opt-in: default compress must not shard, and the
+	// WithParallelism dispatch must still produce identical output.
+	defCodes, defBounds := enc.compress(data, endPositions, model.matcher)
+	parEnc := NewEncoder(WithParallelism(8))
+	optCodes, optBounds := parEnc.compress(data, endPositions, model.matcher)
+	if !slices.Equal(serialCodes, defCodes) || !slices.Equal(serialBounds, defBounds) {
+		t.Fatal("default compress differs from serial")
+	}
+	if !slices.Equal(serialCodes, optCodes) || !slices.Equal(serialBounds, optBounds) {
+		t.Fatal("WithParallelism compress differs from serial")
+	}
 }

@@ -27,6 +27,7 @@ type Config struct {
 	TrainingSampleBytes int    // Maximum sampled training bytes (0 = default 1 MiB)
 	TemplateStratified  bool   // Enable template-based stratified sampling for training.
 	TemplateMaxClusters int    // Maximum number of template clusters for stratified sampling.
+	Parallelism         int    // Max goroutines for the compression stage (0 or 1 = serial).
 }
 
 // Option is a functional option for configuring the compressor.
@@ -79,6 +80,19 @@ func WithTemplateStratifiedSampling(maxClusters int) Option {
 	return func(c *Config) {
 		c.TemplateStratified = true
 		c.TemplateMaxClusters = maxClusters
+	}
+}
+
+// WithParallelism allows Encode to compress rows with up to n goroutines once
+// the input is large enough to shard (about 1 MiB). Output is byte-identical
+// to serial encoding. n <= 0 uses runtime.GOMAXPROCS(0); without this option
+// encoding is single-goroutine.
+func WithParallelism(n int) Option {
+	if n <= 0 {
+		n = runtime.GOMAXPROCS(0)
+	}
+	return func(c *Config) {
+		c.Parallelism = n
 	}
 }
 
@@ -632,9 +646,10 @@ func (e *Encoder) buildTokens(
 	return dictionary, tokenBoundaries
 }
 
-// Parallel encode kicks in above these sizes; below them goroutine and
-// stitch overhead beats the win. Rows parse independently against the shared
-// read-only matcher, so output is byte-identical to the serial path.
+// Parallel encode (opt-in via WithParallelism) kicks in above these sizes;
+// below them goroutine and stitch overhead beats the win. Rows parse
+// independently against the shared read-only matcher, so output is
+// byte-identical to the serial path.
 const (
 	parallelEncodeMinBytes   = 1 << 20
 	parallelEncodeShardBytes = 256 << 10
@@ -643,8 +658,8 @@ const (
 // compress parses the data using the trained matcher, which emits sorted
 // token ids directly (train rewrites its stored ids after sorting).
 func (e *Encoder) compress(data []byte, endPositions []int, matcher *matcher) ([]uint16, []int) {
-	if len(data) >= parallelEncodeMinBytes {
-		if shards := min(runtime.GOMAXPROCS(0), len(data)/parallelEncodeShardBytes); shards > 1 {
+	if e.config.Parallelism > 1 && len(data) >= parallelEncodeMinBytes {
+		if shards := min(e.config.Parallelism, len(data)/parallelEncodeShardBytes); shards > 1 {
 			return e.compressParallel(data, endPositions, matcher, shards)
 		}
 	}
