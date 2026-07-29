@@ -235,3 +235,6 @@ go test -bench=. ./...
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Portions are derived from third-party projects; see
+[THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) for their notices.
