@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"slices"
 	"sort"
+	"sync"
 )
 
 const (
@@ -37,8 +41,18 @@ const (
 	maxTokenBoundsRead     = maxStagePayloadBytes / 4
 	maxStringBoundaryValue = uint64(maxCompressedTokenRead)
 
+	// decodeKernelMaxCodes caps one decodeFast call: assembly is not
+	// async-preemptible, so unbounded kernel runs over huge archives would
+	// stall GC and scheduling for the whole decode.
+	decodeKernelMaxCodes = 1 << 20
+
 	compressedDataCodebookEscapeByte = uint8(0xFF)
 	compressedDataCodebookMaxEntries = int(compressedDataCodebookEscapeByte)
+
+	// decodeSlack is the fixed copy width of the gather-copy decode loops: every
+	// token whose bytes allow it is written as one 16-byte copy, and the extra
+	// tail capacity absorbs the over-store of the final token.
+	decodeSlack = 16
 )
 
 // Wire format (version 2):
@@ -171,14 +185,65 @@ func readStageHeader(r io.Reader) (wireStageHeader, int64, error) {
 	}, total, nil
 }
 
+// readExact reads exactly n bytes from r, reusing scratch's capacity. Reads
+// proceed in at most 1 MiB chunks and the buffer doubles as bytes actually
+// arrive, so a corrupt header declaring a huge payload cannot force a large
+// allocation up front — a truncated stream allocates at most twice what it
+// delivers.
+func readExact(r io.Reader, scratch []byte, n int) ([]byte, int64, error) {
+	const step = 1 << 20
+	buf := scratch[:0]
+	var total int64
+	for len(buf) < n {
+		chunk := n - len(buf)
+		if chunk > step {
+			chunk = step
+		}
+		start := len(buf)
+		if cap(buf) < start+chunk {
+			newCap := 2 * cap(buf)
+			if newCap < start+chunk {
+				newCap = start + chunk
+			}
+			grown := make([]byte, start, newCap)
+			copy(grown, buf)
+			buf = grown
+		}
+		buf = buf[:start+chunk]
+		read, err := io.ReadFull(r, buf[start:])
+		total += int64(read)
+		if err != nil {
+			// A clean EOF after earlier chunks is still a truncated payload.
+			if errors.Is(err, io.EOF) && start+read > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return buf[:start+read], total, err
+		}
+	}
+	return buf, total, nil
+}
+
+// padDictionary returns a copy of dict with decodeSlack zero bytes appended,
+// mirroring the read-padded dictionary of the reference implementation: every
+// token then satisfies the decode fast path's start+decodeSlack <= len(dict)
+// bound. Decode never assumes the padding — unpadded archives (hand-built or
+// serialized before padding existed) take the exact-copy path for tokens near
+// the dictionary end.
+func padDictionary(dict []byte) []byte {
+	padded := make([]byte, len(dict)+decodeSlack)
+	copy(padded, dict)
+	return padded
+}
+
 // Archive holds the compressed data and the dictionary needed to decompress it.
-// It replaces the old Dictionary struct.
 type Archive struct {
 	// Compressed data storage
 	CompressedData   []uint16 // Sequence of token IDs
 	StringBoundaries []int    // End positions for each string
 
-	// Dictionary storage
+	// Dictionary storage. Dictionary may carry trailing bytes past the last
+	// token boundary — encoders append decodeSlack zero bytes of read padding
+	// — and readers tolerate them.
 	Dictionary      []byte   // Raw token data
 	TokenBoundaries []uint32 // Token end positions in dictionary
 
@@ -198,7 +263,7 @@ func (a *Archive) tokenBitWidth() uint8 {
 }
 
 func packed12ByteSize(tokenCount int) int {
-	return (tokenCount*int(tokenBitWidth12) + 7) / 8
+	return int((int64(tokenCount)*int64(tokenBitWidth12) + 7) / 8)
 }
 
 // Rows returns the number of strings encoded in this archive.
@@ -209,162 +274,212 @@ func (a *Archive) Rows() int {
 	return len(a.StringBoundaries) - 1
 }
 
-// DecodedLen reports the decoded length in bytes for one string.
-func (a *Archive) DecodedLen(index int) (int, error) {
+// rowCodes returns the token codes for one string.
+func (a *Archive) rowCodes(index int) ([]uint16, error) {
 	if index < 0 || index >= a.Rows() {
-		return 0, fmt.Errorf("index out of bounds: %d", index)
+		return nil, fmt.Errorf("index out of bounds: %d", index)
 	}
-
 	start := a.StringBoundaries[index]
 	end := a.StringBoundaries[index+1]
 	if start < 0 || end < start || end > len(a.CompressedData) {
-		return 0, fmt.Errorf("corrupted string boundaries for index %d", index)
+		return nil, fmt.Errorf("corrupted string boundaries for index %d", index)
 	}
+	return a.CompressedData[start:end], nil
+}
 
+// decodedSize validates every code in codes against the token boundaries and
+// dictionary, returning the total decoded byte length. It is the checked
+// pre-pass that lets appendTokens run without per-token error handling.
+func (a *Archive) decodedSize(codes []uint16) (int, error) {
 	tokenBounds := a.TokenBoundaries
-	dictionary := a.Dictionary
-	dictLen := uint32(len(dictionary))
+	dictLen := uint32(len(a.Dictionary))
 	boundsLen := len(tokenBounds)
 
-	n := 0
-	for tokenPos, tokenID := range a.CompressedData[start:end] {
-		absPos := start + tokenPos
-		tokenIdx := int(tokenID)
-		if tokenIdx+1 >= boundsLen {
-			return 0, fmt.Errorf("invalid token ID at row %d token %d (abs %d): %d", index, tokenPos, absPos, tokenID)
+	var n uint64
+	for tokenPos, tokenID := range codes {
+		if int(tokenID)+1 >= boundsLen {
+			return 0, fmt.Errorf("invalid token ID at token %d: %d", tokenPos, tokenID)
 		}
-		tokenStart := tokenBounds[tokenIdx]
-		tokenEnd := tokenBounds[tokenIdx+1]
+		tokenStart := tokenBounds[tokenID]
+		tokenEnd := tokenBounds[int(tokenID)+1]
 		if tokenEnd > dictLen || tokenStart > tokenEnd {
-			return 0, fmt.Errorf("corrupted token boundaries at row %d token %d (abs %d) for ID %d", index, tokenPos, absPos, tokenID)
+			return 0, fmt.Errorf("corrupted token boundaries at token %d for ID %d", tokenPos, tokenID)
 		}
-		tokenBytes := dictionary[tokenStart:tokenEnd]
-		n += len(tokenBytes)
+		n += uint64(tokenEnd - tokenStart)
+		if n > math.MaxInt-decodeSlack {
+			return 0, fmt.Errorf("decoded length overflows at token %d", tokenPos)
+		}
+	}
+	return int(n), nil
+}
+
+// appendTokens appends the decoded bytes for codes to dst. The caller has
+// validated codes with decodedSize; n is that decoded length. decodeFast
+// writes runs of fixed 16-byte copies — the decodeSlack tail capacity absorbs
+// the final over-store — and each token it stops at (dictionary-end or longer
+// than decodeSlack; corruption cannot survive the pre-pass) is exact-copied.
+func (a *Archive) appendTokens(dst []byte, codes []uint16, n int) []byte {
+	tokenBounds := a.TokenBoundaries
+	dict := a.Dictionary
+
+	dst = slices.Grow(dst, n+decodeSlack)
+	w := len(dst)
+	buf := dst[:cap(dst)]
+	for i := 0; i < len(codes); {
+		i, w = decodeFast(buf, w, codes[:min(i+decodeKernelMaxCodes, len(codes))], i, tokenBounds, dict)
+		if i >= len(codes) {
+			break
+		}
+		tokenStart := tokenBounds[codes[i]]
+		tokenEnd := tokenBounds[int(codes[i])+1]
+		copy(buf[w:], dict[tokenStart:tokenEnd])
+		w += int(tokenEnd - tokenStart)
+		i++
+	}
+	return buf[:w]
+}
+
+// copyTokenExact validates token tokenID and exact-copies its bytes into
+// buffer[offset:], returning the token's length. pos is the code position for
+// error context. The checked exact-copy that settles every token decodeFast
+// stops at in copyTokens.
+func (a *Archive) copyTokenExact(buffer []byte, tokenID uint16, pos, offset int) (int, error) {
+	tokenBounds := a.TokenBoundaries
+	if int(tokenID)+1 >= len(tokenBounds) {
+		return 0, fmt.Errorf("invalid token ID at token %d: %d", pos, tokenID)
+	}
+	dict := a.Dictionary
+	tokenStart := tokenBounds[tokenID]
+	tokenEnd := tokenBounds[int(tokenID)+1]
+	if uint64(tokenEnd) > uint64(len(dict)) || tokenStart > tokenEnd {
+		return 0, fmt.Errorf("corrupted token boundaries at token %d for ID %d", pos, tokenID)
+	}
+	exactLen := int(tokenEnd - tokenStart)
+	if exactLen > len(buffer)-offset {
+		return 0, fmt.Errorf("%w at token %d: need %d bytes, have %d", ErrShortBuffer, pos, offset+exactLen, len(buffer))
+	}
+	copy(buffer[offset:], dict[tokenStart:tokenEnd])
+	return exactLen, nil
+}
+
+// copyTokens decodes codes into buffer, validating every token and never
+// writing past len(buffer). It returns the number of bytes written.
+//
+// decodeFast runs the over-copy fast path across every token it can prove
+// safe; each token it stops at — flush against the dictionary end, longer
+// than decodeSlack, corrupt, or with fewer than decodeSlack spare output
+// bytes — is settled by the fully checked copyTokenExact, and the fast path
+// resumes. Every outer iteration advances at least one token, so the loop
+// terminates. Row-sized decodes run a Go copy of the fast path instead: the
+// kernel's call overhead dominates short rows (measured 7.0ns vs 7.8ns per
+// row on BenchmarkOnPairLargeDatasetDecompression).
+func (a *Archive) copyTokens(buffer []byte, codes []uint16) (int, error) {
+	tokenBounds := a.TokenBoundaries
+	dict := a.Dictionary
+	dictLen := len(dict)
+
+	offset := 0
+	i := 0
+	if len(codes) <= len(buffer)/decodeSlack {
+		for ; i < len(codes); i++ {
+			tokenID := codes[i]
+			if int(tokenID)+1 >= len(tokenBounds) {
+				return 0, fmt.Errorf("invalid token ID at token %d: %d", i, tokenID)
+			}
+			tokenStart := tokenBounds[tokenID]
+			tokenLen := tokenBounds[int(tokenID)+1] - tokenStart
+			if tokenLen <= decodeSlack && uint64(tokenStart)+decodeSlack <= uint64(dictLen) {
+				ts := int(tokenStart)
+				copy(buffer[offset:offset+decodeSlack], dict[ts:ts+decodeSlack])
+				offset += int(tokenLen)
+				continue
+			}
+			if tokenLen > decodeSlack {
+				break
+			}
+			// Short token flush against the dictionary end: exact copy, in the
+			// buffer by the dispatch invariant (every token here advances at
+			// most decodeSlack bytes). Wrapped corrupt boundaries can also land
+			// here with a small distance, so the full guard stays.
+			tokenEnd := tokenBounds[int(tokenID)+1]
+			if uint64(tokenEnd) > uint64(dictLen) || tokenStart > tokenEnd {
+				return 0, fmt.Errorf("corrupted token boundaries at token %d for ID %d", i, tokenID)
+			}
+			copy(buffer[offset:], dict[tokenStart:tokenEnd])
+			offset += int(tokenLen)
+		}
+		if i == len(codes) {
+			return offset, nil
+		}
+	}
+	for i < len(codes) {
+		i, offset = decodeFast(buffer, offset, codes[:min(i+decodeKernelMaxCodes, len(codes))], i, tokenBounds, dict)
+		if i >= len(codes) {
+			break
+		}
+		n, err := a.copyTokenExact(buffer, codes[i], i, offset)
+		if err != nil {
+			return 0, err
+		}
+		offset += n
+		i++
+	}
+	return offset, nil
+}
+
+// DecodedLen reports the decoded length in bytes for one string.
+func (a *Archive) DecodedLen(index int) (int, error) {
+	codes, err := a.rowCodes(index)
+	if err != nil {
+		return 0, err
+	}
+	n, err := a.decodedSize(codes)
+	if err != nil {
+		return 0, fmt.Errorf("row %d: %w", index, err)
 	}
 	return n, nil
 }
 
 // AppendRow appends the decoded string at index to dst.
 func (a *Archive) AppendRow(dst []byte, index int) ([]byte, error) {
-	if index < 0 || index >= a.Rows() {
-		return dst, fmt.Errorf("index out of bounds: %d", index)
+	codes, err := a.rowCodes(index)
+	if err != nil {
+		return dst, err
 	}
-
-	start := a.StringBoundaries[index]
-	end := a.StringBoundaries[index+1]
-	if start < 0 || end < start || end > len(a.CompressedData) {
-		return dst, fmt.Errorf("corrupted string boundaries for index %d", index)
+	n, err := a.decodedSize(codes)
+	if err != nil {
+		return dst, fmt.Errorf("row %d: %w", index, err)
 	}
-
-	tokenBounds := a.TokenBoundaries
-	dictionary := a.Dictionary
-	dictLen := uint32(len(dictionary))
-	boundsLen := len(tokenBounds)
-
-	for tokenPos, tokenID := range a.CompressedData[start:end] {
-		absPos := start + tokenPos
-		tokenIdx := int(tokenID)
-		if tokenIdx+1 >= boundsLen {
-			return dst, fmt.Errorf("invalid token ID at row %d token %d (abs %d): %d", index, tokenPos, absPos, tokenID)
-		}
-		tokenStart := tokenBounds[tokenIdx]
-		tokenEnd := tokenBounds[tokenIdx+1]
-		if tokenEnd > dictLen || tokenStart > tokenEnd {
-			return dst, fmt.Errorf("corrupted token boundaries at row %d token %d (abs %d) for ID %d", index, tokenPos, absPos, tokenID)
-		}
-		tokenBytes := dictionary[tokenStart:tokenEnd]
-		dst = append(dst, tokenBytes...)
-	}
-	return dst, nil
+	return a.appendTokens(dst, codes, n), nil
 }
 
 // AppendAll appends all decoded strings to dst.
 func (a *Archive) AppendAll(dst []byte) ([]byte, error) {
-	tokenBounds := a.TokenBoundaries
-	dictionary := a.Dictionary
-	dictLen := uint32(len(dictionary))
-	boundsLen := len(tokenBounds)
-
-	for tokenPos, tokenID := range a.CompressedData {
-		tokenIdx := int(tokenID)
-		if tokenIdx+1 >= boundsLen {
-			return dst, fmt.Errorf("invalid token ID at token %d: %d", tokenPos, tokenID)
-		}
-		tokenStart := tokenBounds[tokenIdx]
-		tokenEnd := tokenBounds[tokenIdx+1]
-		if tokenEnd > dictLen || tokenStart > tokenEnd {
-			return dst, fmt.Errorf("corrupted token boundaries at token %d for ID %d", tokenPos, tokenID)
-		}
-		tokenBytes := dictionary[tokenStart:tokenEnd]
-		dst = append(dst, tokenBytes...)
+	n, err := a.decodedSize(a.CompressedData)
+	if err != nil {
+		return dst, err
 	}
-	return dst, nil
+	return a.appendTokens(dst, a.CompressedData, n), nil
 }
 
-// DecompressString decompresses a specific string into buffer.
+// DecompressString decompresses a specific string into buffer. Bytes of
+// buffer beyond the returned length are scratch space and may be overwritten.
 func (a *Archive) DecompressString(index int, buffer []byte) (int, error) {
-	if index < 0 || index >= a.Rows() {
-		return 0, fmt.Errorf("index out of bounds: %d", index)
+	codes, err := a.rowCodes(index)
+	if err != nil {
+		return 0, err
 	}
-	start := a.StringBoundaries[index]
-	end := a.StringBoundaries[index+1]
-	if start < 0 || end < start || end > len(a.CompressedData) {
-		return 0, fmt.Errorf("corrupted string boundaries for index %d", index)
+	n, err := a.copyTokens(buffer, codes)
+	if err != nil {
+		return 0, fmt.Errorf("row %d: %w", index, err)
 	}
-
-	tokenBounds := a.TokenBoundaries
-	dictionary := a.Dictionary
-	dictLen := uint32(len(dictionary))
-	boundsLen := len(tokenBounds)
-
-	offset := 0
-	for tokenPos, tokenID := range a.CompressedData[start:end] {
-		absPos := start + tokenPos
-		tokenIdx := int(tokenID)
-		if tokenIdx+1 >= boundsLen {
-			return 0, fmt.Errorf("invalid token ID at row %d token %d (abs %d): %d", index, tokenPos, absPos, tokenID)
-		}
-		tokenStart := tokenBounds[tokenIdx]
-		tokenEnd := tokenBounds[tokenIdx+1]
-		if tokenEnd > dictLen || tokenStart > tokenEnd {
-			return 0, fmt.Errorf("corrupted token boundaries at row %d token %d (abs %d) for ID %d", index, tokenPos, absPos, tokenID)
-		}
-		tokenBytes := dictionary[tokenStart:tokenEnd]
-		if offset+len(tokenBytes) > len(buffer) {
-			return 0, fmt.Errorf("%w at row %d token %d (abs %d): need %d bytes, have %d", ErrShortBuffer, index, tokenPos, absPos, offset+len(tokenBytes), len(buffer))
-		}
-		copy(buffer[offset:offset+len(tokenBytes)], tokenBytes)
-		offset += len(tokenBytes)
-	}
-	return offset, nil
+	return n, nil
 }
 
-// DecompressAllChecked decompresses all strings into a single buffer.
+// DecompressAllChecked decompresses all strings into a single buffer. Bytes of
+// buffer beyond the returned length are scratch space and may be overwritten.
 func (a *Archive) DecompressAllChecked(buffer []byte) (int, error) {
-	tokenBounds := a.TokenBoundaries
-	dictionary := a.Dictionary
-	dictLen := uint32(len(dictionary))
-	boundsLen := len(tokenBounds)
-
-	offset := 0
-	for tokenPos, tokenID := range a.CompressedData {
-		tokenIdx := int(tokenID)
-		if tokenIdx+1 >= boundsLen {
-			return 0, fmt.Errorf("invalid token ID at token %d: %d", tokenPos, tokenID)
-		}
-		tokenStart := tokenBounds[tokenIdx]
-		tokenEnd := tokenBounds[tokenIdx+1]
-		if tokenEnd > dictLen || tokenStart > tokenEnd {
-			return 0, fmt.Errorf("corrupted token boundaries at token %d for ID %d", tokenPos, tokenID)
-		}
-		tokenBytes := dictionary[tokenStart:tokenEnd]
-		if offset+len(tokenBytes) > len(buffer) {
-			return 0, fmt.Errorf("%w at token %d: need %d bytes, have %d", ErrShortBuffer, tokenPos, offset+len(tokenBytes), len(buffer))
-		}
-		copy(buffer[offset:offset+len(tokenBytes)], tokenBytes)
-		offset += len(tokenBytes)
-	}
-	return offset, nil
+	return a.copyTokens(buffer, a.CompressedData)
 }
 
 // SpaceUsed returns the total space (in bytes) used by the archive.
@@ -446,14 +561,23 @@ func encodeCompressedDataStage(a *Archive) ([]byte, uint8, error) {
 	return best.payload, best.param, nil
 }
 
+// flateWriterPool reuses flate writers across encodes: a BestCompression
+// writer carries ~1 MiB of internal state, and WriteTo runs two encodes per
+// archive, which otherwise dominates serialization cost as GC churn.
+var flateWriterPool = sync.Pool{New: func() any {
+	w, err := flate.NewWriter(io.Discard, flate.BestCompression)
+	if err != nil {
+		panic(err) // impossible: the level is a valid constant
+	}
+	return w
+}}
+
 func encodeFlatePayload(raw []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	w, err := flate.NewWriter(&buf, flate.BestCompression)
-	if err != nil {
-		return nil, err
-	}
+	w := flateWriterPool.Get().(*flate.Writer)
+	defer flateWriterPool.Put(w)
+	w.Reset(&buf)
 	if _, err := w.Write(raw); err != nil {
-		_ = w.Close()
 		return nil, err
 	}
 	if err := w.Close(); err != nil {
@@ -462,8 +586,16 @@ func encodeFlatePayload(raw []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// flateReaderPool mirrors flateWriterPool for the four per-ReadFrom decodes;
+// stdlib flate readers are Resetters, reusing their window buffers.
+var flateReaderPool = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
+
 func decodeFlatePayload(payload []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(payload))
+	r := flateReaderPool.Get().(io.ReadCloser)
+	defer flateReaderPool.Put(r)
+	if err := r.(flate.Resetter).Reset(bytes.NewReader(payload), nil); err != nil {
+		return nil, err
+	}
 	defer r.Close()
 
 	limited := io.LimitReader(r, maxStagePayloadBytes+1)
@@ -605,6 +737,11 @@ func decodeCompressedDataStageCodebook(payload []byte, tokenBitWidth uint8) ([]u
 	}
 
 	stream := payload[headerLen:]
+	// Every token consumes at least one stream byte, so the declared count is
+	// bounded by the bytes actually present — checked before allocating.
+	if uint64(compressedLen) > uint64(len(stream)) {
+		return nil, fmt.Errorf("compressed_data codebook payload underrun: %d tokens, %d stream bytes", compressedLen, len(stream))
+	}
 	compressedData := make([]uint16, compressedLen)
 	inIdx = 0
 	for i := 0; i < len(compressedData); i++ {
@@ -1244,6 +1381,8 @@ func validateArchiveStructure(a *Archive) error {
 			return fmt.Errorf("token boundaries not monotonic at index %d", i)
 		}
 	}
+	// Strictly greater: dictionary bytes past the last boundary are legal —
+	// encoders append read padding (see padDictionary).
 	if last := a.TokenBoundaries[len(a.TokenBoundaries)-1]; int(last) > len(a.Dictionary) {
 		return fmt.Errorf("token boundary %d out of range for dictionary size %d", last, len(a.Dictionary))
 	}
@@ -1404,14 +1543,10 @@ func (a *Archive) ReadFrom(r io.Reader) (int64, error) {
 
 		switch header.name {
 		case stageCompressedData, stageStringBoundaries, stageDictionary, stageTokenBoundaries:
-			payloadLen := int(header.dataLen)
-			if cap(payloadScratch) < payloadLen {
-				payloadScratch = make([]byte, payloadLen)
-			}
-			payload := payloadScratch[:payloadLen]
 			payloadOffset := total
-			nPayload, err := io.ReadFull(r, payload)
-			total += int64(nPayload)
+			payload, nPayload, err := readExact(r, payloadScratch, int(header.dataLen))
+			payloadScratch = payload
+			total += nPayload
 			if err != nil {
 				return total, fmt.Errorf("read stage %q payload at offset %d (stage index %d): %w", header.name, payloadOffset, i, err)
 			}

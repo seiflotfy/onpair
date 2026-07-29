@@ -3,7 +3,8 @@ package onpair
 // Model is a reusable trained dictionary.
 type Model struct {
 	config          Config
-	matcher         *Matcher
+	matcher         *matcher
+	codeRemap       []uint16 // creation-order token id → sorted dictionary id
 	dictionary      []byte
 	tokenBoundaries []uint32
 }
@@ -30,10 +31,11 @@ func TrainModel(strings []string, opts ...Option) (*Model, error) {
 func (m *Model) Train(strings []string) error {
 	enc := &Encoder{config: m.config}
 	data, endPositions := flattenStrings(strings)
-	matcher, dict, tokenBoundaries := enc.train(data, endPositions)
+	matcher, dict, tokenBoundaries, remap := enc.train(data, endPositions)
 	m.matcher = matcher
-	m.dictionary = append(m.dictionary[:0], dict...)
-	m.tokenBoundaries = append(m.tokenBoundaries[:0], tokenBoundaries...)
+	m.codeRemap = remap
+	m.dictionary = dict
+	m.tokenBoundaries = tokenBoundaries
 	return nil
 }
 
@@ -44,14 +46,13 @@ func (m *Model) Encode(strings []string) (*Archive, error) {
 	}
 	enc := &Encoder{config: m.config}
 	data, endPositions := flattenStrings(strings)
-	compressedData, stringBoundaries := enc.compress(data, endPositions, m.matcher)
+	compressedData, stringBoundaries := enc.compress(data, endPositions, m.matcher, m.codeRemap)
 
-	dict := append([]byte(nil), m.dictionary...)
 	tokenBoundaries := append([]uint32(nil), m.tokenBoundaries...)
 	return &Archive{
 		CompressedData:          compressedData,
 		StringBoundaries:        stringBoundaries,
-		Dictionary:              dict,
+		Dictionary:              padDictionary(m.dictionary),
 		TokenBoundaries:         tokenBoundaries,
 		compressedTokenBitWidth: resolveTokenBitWidth(enc.config),
 	}, nil
@@ -67,15 +68,15 @@ func (e *Encoder) Encode(strings []string) (*Archive, error) {
 	data, endPositions := flattenStrings(strings)
 
 	// Train the dictionary
-	matcher, dict, tokenBoundaries := e.train(data, endPositions)
+	matcher, dict, tokenBoundaries, remap := e.train(data, endPositions)
 
 	// Compress the data
-	compressedData, stringBoundaries := e.compress(data, endPositions, matcher)
+	compressedData, stringBoundaries := e.compress(data, endPositions, matcher, remap)
 
 	return &Archive{
 		CompressedData:          compressedData,
 		StringBoundaries:        stringBoundaries,
-		Dictionary:              dict,
+		Dictionary:              padDictionary(dict),
 		TokenBoundaries:         tokenBoundaries,
 		compressedTokenBitWidth: resolveTokenBitWidth(e.config),
 	}, nil

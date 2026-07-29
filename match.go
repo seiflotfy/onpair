@@ -3,6 +3,7 @@ package onpair
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"math/bits"
 	"unsafe"
 )
@@ -25,18 +26,20 @@ const (
 	maxOnPair16BucketSize = 128
 )
 
-// Matcher is a hybrid longest prefix matcher supporting arbitrary-length patterns.
+// matcher is a hybrid longest prefix matcher supporting patterns up to
+// 8+65535 bytes (insert rejects longer ones).
 //
-// Combines direct hash lookup for short patterns with bucketed search for long patterns.
-// Both paths are gated by 2-byte-prefix filters so find() skips the Go map
-// lookup entirely when no stored pattern starts with those bytes.
-type Matcher struct {
-	longMatchBuckets longBucketTable   // 8-byte prefix → candidate bucket (sorted desc by suffix length)
-	shortMatchLookup [9]u64U16Table    // length → (prefix, token ID)
-	lengthByPrefix2  *[65536]uint8     // bit L set ⇒ some short token of length L starts with these 2 LE bytes
-	longBits2        *[1024]uint64     // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
-	dictionary       []byte            // Suffix storage for long patterns
-	endPositions     []uint32          // Boundary positions in dictionary
+// Combines direct table lookup for short patterns with bucketed search for
+// long patterns. Both paths are gated by 2-byte-prefix filters so find()
+// skips the table probe entirely when no stored pattern starts with those
+// bytes.
+type matcher struct {
+	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket (sorted desc by suffix length)
+	shortMatchLookup [9]u64U16Table  // length → (prefix, token ID)
+	lengthByPrefix2  *[65536]uint8   // bit L-1 set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
+	dictionary       []byte          // Suffix storage for long patterns
+	endPositions     []uint32        // Boundary positions in dictionary
 	onPair16         bool
 	bucketSizeLimit  int
 }
@@ -70,14 +73,14 @@ func (b *longBucket) swap(i, j int) {
 }
 
 // newMatcher creates a new empty longest prefix matcher.
-func newMatcher(maxTokenLen int) *Matcher {
+func newMatcher(maxTokenLen int) *matcher {
 	onPair16 := maxTokenLen == 16
 	bucketSizeLimit := 0
 	if onPair16 {
 		bucketSizeLimit = maxOnPair16BucketSize
 	}
 
-	return &Matcher{
+	return &matcher{
 		endPositions:    []uint32{0},
 		onPair16:        onPair16,
 		bucketSizeLimit: bucketSizeLimit,
@@ -94,8 +97,13 @@ func newMatcher(maxTokenLen int) *Matcher {
 // efficient longest-match-first lookup during matching.
 //
 // IMPORTANT: Token IDs must be inserted sequentially starting from 0!
-func (m *Matcher) insert(entry []byte, id uint16) bool {
+func (m *matcher) insert(entry []byte, id uint16) bool {
 	if len(entry) > minMatch {
+		if len(entry)-minMatch > math.MaxUint16 {
+			// suffixLens stores uint16; a longer pattern would silently
+			// truncate and corrupt greedy matching, so reject it instead.
+			return false
+		}
 		// Long pattern: store 8-byte prefix in bucket, suffix in dictionary
 		prefix := bytesToU64LE(entry, minMatch)
 		bucket := m.longMatchBuckets.get(prefix)
@@ -148,7 +156,9 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 		if m.lengthByPrefix2 == nil {
 			m.lengthByPrefix2 = new([65536]uint8)
 		}
-		m.lengthByPrefix2[uint16(prefix)] |= 1 << uint(len(entry))
+		// Bit L-1 for length L: lengths 2..8 fit in uint8, where bit 8 of a
+		// plain 1<<L would overflow to zero and make 8-byte tokens unmatchable.
+		m.lengthByPrefix2[uint16(prefix)] |= 1 << uint(len(entry)-1)
 		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 	}
 	return true
@@ -161,13 +171,20 @@ func (m *Matcher) insert(entry []byte, id uint16) bool {
 //
 // 1. Long pattern search: Check bucketed patterns (>8 bytes) first for longest matches
 // 2. Short pattern search: Check direct lookup patterns (≤8 bytes) in decreasing length order
-func (m *Matcher) find(data []byte) (uint16, int, bool) {
+func (m *matcher) find(data []byte) (uint16, int, bool) {
+	// The first up-to-8 bytes serve as both the long-bucket prefix key and the
+	// short-lookup probe window, so load them once.
+	maxLen := minMatch
+	if len(data) < maxLen {
+		maxLen = len(data)
+	}
+	low8 := bytesToU64LE(data, maxLen)
+
 	// Phase 1: Long pattern search (>8 bytes) - check longest matches first.
-	// Gate map access behind a 2-byte-prefix bitset so non-matching inputs
-	// skip the Go map lookup entirely.
+	// Gate table access behind a 2-byte-prefix bitset so non-matching inputs
+	// skip the table probe entirely.
 	if len(data) > minMatch && m.longBits2 != nil {
-		prefix := bytesToU64LE(data, minMatch)
-		p2 := uint16(prefix)
+		p2 := uint16(low8)
 		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
 			inputSuffix := data[minMatch:]
 			inputHeadLen := len(inputSuffix)
@@ -176,7 +193,7 @@ func (m *Matcher) find(data []byte) (uint16, int, bool) {
 			}
 			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
-			if bucket := m.longMatchBuckets.get(prefix); bucket != nil {
+			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
 				heads := bucket.heads
 				lens := bucket.suffixLens
 				for i := 0; i < len(heads); i++ {
@@ -209,23 +226,16 @@ func (m *Matcher) find(data []byte) (uint16, int, bool) {
 
 	// Phase 2: Short pattern search (≤8 bytes) - longest to shortest.
 	// Use 2-byte-prefix bitmask to skip lengths with no candidates.
-	maxLen := minMatch
-	if len(data) < maxLen {
-		maxLen = len(data)
-	}
-
 	if maxLen >= 2 && m.lengthByPrefix2 != nil {
-		prefix := bytesToU64LE(data, maxLen)
-		lenMask := m.lengthByPrefix2[uint16(prefix)]
-		// Drop bits for lengths > maxLen. maxLen ≤ 8 so mask fits in uint8.
-		lenMask &= (1 << (uint(maxLen) + 1)) - 1
+		lenMask := m.lengthByPrefix2[uint16(low8)]
+		// Drop bits for lengths > maxLen (bit L-1 encodes length L).
+		lenMask &= (1 << uint(maxLen)) - 1
 		for lenMask != 0 {
-			length := bits.Len8(lenMask) - 1
-			maskedPrefix := prefix & masks[length]
-			if id, ok := m.shortMatchLookup[length].get(maskedPrefix); ok {
+			length := bits.Len8(lenMask)
+			if id, ok := m.shortMatchLookup[length].get(low8 & masks[length]); ok {
 				return id, length, true
 			}
-			lenMask &^= 1 << length
+			lenMask &^= 1 << (length - 1)
 		}
 	}
 	if len(data) > 0 {

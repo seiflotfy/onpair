@@ -184,12 +184,10 @@ func (t *u64U16Table) reinsert(key uint64, value uint16) {
 	}
 }
 
-// hashU64 is the splitmix64 finalizer — cheap, avalanches well.
+// hashU64 is Fibonacci multiplicative hashing with the high bits folded back
+// down, since callers mask the low bits. Two ops on the probe's critical path;
+// the tables stay at most half full, so the weaker avalanche is enough.
 func hashU64(k uint64) uint64 {
-	k ^= k >> 30
-	k *= 0xbf58476d1ce4e5b9
-	k ^= k >> 27
-	k *= 0x94d049bb133111eb
-	k ^= k >> 31
-	return k
+	k *= 0x9e3779b97f4a7c15
+	return k ^ (k >> 29)
 }

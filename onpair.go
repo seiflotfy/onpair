@@ -2,9 +2,10 @@ package onpair
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
-	"math"
-	"sort"
+	"math/bits"
+	"slices"
 )
 
 const (
@@ -110,7 +111,58 @@ const (
 	templateOtherClusterKey    = "__template_other__"
 )
 
-func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []uint32) {
+// train builds the dictionary in creation order, then sorts it into strict
+// bytewise-lexicographic order — the property compressed-domain search binary-
+// searches over. The matcher keeps creation-order ids; remap translates them
+// to sorted ids at compress time.
+func (e *Encoder) train(data []byte, endPositions []int) (*matcher, []byte, []uint32, []uint16) {
+	matcher, dictionary, tokenBoundaries := e.trainUnsorted(data, endPositions)
+	dictionary, tokenBoundaries, remap := sortDictionary(dictionary, tokenBoundaries)
+	return matcher, dictionary, tokenBoundaries, remap
+}
+
+// sortDictionary reorders tokens into strict bytewise-lexicographic order,
+// returning the sorted dictionary, its boundaries, and the remap from
+// creation-order token id to sorted id. Byte-equal duplicates — a merge can
+// recreate an existing token's bytes through a different pair split — collapse
+// into one token, with every duplicate id remapped to it.
+func sortDictionary(dictionary []byte, tokenBoundaries []uint32) ([]byte, []uint32, []uint16) {
+	n := len(tokenBoundaries) - 1
+	token := func(i int) []byte { return dictionary[tokenBoundaries[i]:tokenBoundaries[i+1]] }
+	order := make([]int, n)
+	// Big-endian first-8-bytes sort keys: most comparisons resolve on one
+	// integer compare; byte-equal 8-byte prefixes (including zero-padding
+	// ties) fall back to the full compare.
+	keys := make([]uint64, n)
+	for i := range order {
+		order[i] = i
+		tok := token(i)
+		keys[i] = bits.ReverseBytes64(bytesToU64LE(tok, len(tok)))
+	}
+	slices.SortFunc(order, func(a, b int) int {
+		if keys[a] != keys[b] {
+			return cmp.Compare(keys[a], keys[b])
+		}
+		return bytes.Compare(token(a), token(b))
+	})
+
+	sortedDict := make([]byte, 0, len(dictionary))
+	sortedBounds := make([]uint32, 1, n+1)
+	remap := make([]uint16, n)
+	var prev []byte
+	for _, oldID := range order {
+		tok := token(oldID)
+		if len(sortedBounds) == 1 || !bytes.Equal(prev, tok) {
+			sortedDict = append(sortedDict, tok...)
+			sortedBounds = append(sortedBounds, uint32(len(sortedDict)))
+			prev = sortedDict[sortedBounds[len(sortedBounds)-2]:]
+		}
+		remap[oldID] = uint16(len(sortedBounds) - 2)
+	}
+	return sortedDict, sortedBounds, remap
+}
+
+func (e *Encoder) trainUnsorted(data []byte, endPositions []int) (*matcher, []byte, []uint32) {
 	tokenBoundaries := make([]uint32, 0, singleByteTokens+4096)
 	tokenBoundaries = append(tokenBoundaries, 0)
 	dictionary := make([]byte, 0, 1024*1024)
@@ -159,21 +211,13 @@ func (e *Encoder) train(data []byte, endPositions []int) (*Matcher, []byte, []ui
 		}
 	}
 
-	// Determine threshold
-	threshold := e.config.Threshold
-	if threshold == 0 {
-		sampleSizeMiB := float64(sampleBytes) / (1024.0 * 1024.0)
-		threshold = uint16(math.Max(2.0, math.Log2(sampleSizeMiB)))
-	}
-
-	// Determine limits
+	// Build merged tokens from sample. A zero threshold selects the adaptive
+	// controller inside buildTokens.
 	limitTokenID := resolveTokenLimit(e.config)
-
-	// Build merged tokens from sample
 	dictionary, tokenBoundaries = e.buildTokens(
-		data, endPositions, sampleIndices,
+		data, endPositions, sampleIndices, sampleBytes,
 		matcher, dictionary, tokenBoundaries,
-		threshold, limitTokenID,
+		e.config.Threshold, limitTokenID,
 	)
 
 	return matcher, dictionary, tokenBoundaries
@@ -249,16 +293,13 @@ func stratifiedSampleIndicesByTemplateKey(
 		return shuffledIndices, 0
 	}
 
+	// Group rows by template key, keeping shuffled order within each cluster
+	// and first-seen order across clusters. Overflow clusters collapse into
+	// one catch-all bucket.
 	clusterGroups := make(map[string][]int, 256)
 	clusterOrder := make([]string, 0, 256)
-	totalPoolBytes := 0
-
 	for _, idx := range shuffledIndices {
-		start := endPositions[idx]
-		end := endPositions[idx+1]
-		totalPoolBytes += end - start
-		key := templateKeyFromLine(data[start:end], defaultTemplateTokens)
-
+		key := templateKeyFromLine(data[endPositions[idx]:endPositions[idx+1]], defaultTemplateTokens)
 		if _, exists := clusterGroups[key]; !exists {
 			if maxClusters > 0 && len(clusterGroups) >= maxClusters {
 				key = templateOtherClusterKey
@@ -274,94 +315,23 @@ func stratifiedSampleIndicesByTemplateKey(
 		clusterGroups[key] = append(clusterGroups[key], idx)
 	}
 
-	if len(clusterOrder) == 0 {
-		return sampleIndicesByBytes(shuffledIndices, endPositions, sampleBytesLimit)
-	}
-
-	totalRows := len(shuffledIndices)
-	avgLen := float64(totalPoolBytes) / float64(totalRows)
-	targetRows := int(float64(sampleBytesLimit) / avgLen)
-	if targetRows < 1 {
-		targetRows = 1
-	}
-	if targetRows > totalRows {
-		targetRows = totalRows
-	}
-
-	type clusterQuota struct {
-		key       string
-		quota     int
-		remainder float64
-	}
-	quotas := make([]clusterQuota, 0, len(clusterOrder))
-	allocated := 0
-	for _, key := range clusterOrder {
-		count := len(clusterGroups[key])
-		exact := float64(count) * float64(targetRows) / float64(totalRows)
-		quota := int(exact)
-		quotas = append(quotas, clusterQuota{
-			key:       key,
-			quota:     quota,
-			remainder: exact - float64(quota),
-		})
-		allocated += quota
-	}
-	if allocated < targetRows {
-		sort.SliceStable(quotas, func(i, j int) bool {
-			return quotas[i].remainder > quotas[j].remainder
-		})
-		remaining := targetRows - allocated
-		for i := 0; remaining > 0; i++ {
-			idx := i % len(quotas)
-			quotas[idx].quota++
-			remaining--
-		}
-	}
-
-	clusterPos := make(map[string]int, len(quotas))
-	sampleIndices := make([]int, 0, targetRows)
+	// Round-robin one row per cluster per pass until the byte budget is met:
+	// rare templates are represented before dominant ones can exhaust the
+	// budget. The first pass always takes at least one row, so the sample is
+	// never empty.
+	sampleIndices := make([]int, 0, len(shuffledIndices))
 	sampleBytes := 0
-
-	for _, q := range quotas {
-		group := clusterGroups[q.key]
-		n := q.quota
-		if n > len(group) {
-			n = len(group)
-		}
-		if n <= 0 {
-			continue
-		}
-		for i := 0; i < n; i++ {
-			idx := group[i]
-			sampleIndices = append(sampleIndices, idx)
-			sampleBytes += endPositions[idx+1] - endPositions[idx]
-		}
-		clusterPos[q.key] = n
-		if sampleBytes >= sampleBytesLimit {
-			return sampleIndices, sampleBytes
-		}
-	}
-
-	// Top up in round-robin order when byte budget isn't reached due row-length variance.
-	orderedKeys := make([]string, 0, len(quotas))
-	for _, q := range quotas {
-		orderedKeys = append(orderedKeys, q.key)
-	}
-	for sampleBytes < sampleBytesLimit {
+	for pos := 0; sampleBytes < sampleBytesLimit; pos++ {
 		progressed := false
-		for _, key := range orderedKeys {
+		for _, key := range clusterOrder {
 			group := clusterGroups[key]
-			pos := clusterPos[key]
 			if pos >= len(group) {
 				continue
 			}
-
 			idx := group[pos]
-			clusterPos[key] = pos + 1
 			sampleIndices = append(sampleIndices, idx)
 			sampleBytes += endPositions[idx+1] - endPositions[idx]
 			progressed = true
-
 			if sampleBytes >= sampleBytesLimit {
 				break
 			}
@@ -369,10 +339,6 @@ func stratifiedSampleIndicesByTemplateKey(
 		if !progressed {
 			break
 		}
-	}
-
-	if len(sampleIndices) == 0 {
-		return sampleIndicesByBytes(shuffledIndices, endPositions, sampleBytesLimit)
 	}
 	return sampleIndices, sampleBytes
 }
@@ -561,29 +527,27 @@ func looksIPv4Token(token []byte) bool {
 }
 
 // buildTokens discovers and creates merged tokens from the training data.
-// Uses online merging: when a pair reaches threshold frequency, merge immediately.
-// Processes all segments in a single loop using state machine pattern.
+// Uses online merging: when an adjacent token pair reaches the threshold
+// frequency, the pair is merged into a new token immediately and becomes the
+// left side of the next pair. A zero threshold enables the adaptive
+// thresholdController; any other value is a fixed threshold.
 func (e *Encoder) buildTokens(
 	data []byte,
 	endPositions []int,
-	shuffledIndices []int,
-	matcher *Matcher,
+	sampleIndices []int,
+	sampleBytes int,
+	matcher *matcher,
 	dictionary []byte,
 	tokenBoundaries []uint32,
 	threshold uint16,
 	limitTokenID uint16,
 ) ([]byte, []uint32) {
-	if len(shuffledIndices) == 0 {
+	if len(sampleIndices) == 0 {
 		return dictionary, tokenBoundaries
 	}
 
-	nextTokenID := uint16(singleByteTokens)
 	// Pre-size the pair-frequency counter from the sampled byte count.
 	// Roughly 1 pair per ~3 bytes of sampled data (empirical), capped.
-	sampleBytes := 0
-	for _, idx := range shuffledIndices {
-		sampleBytes += endPositions[idx+1] - endPositions[idx]
-	}
 	freqHint := sampleBytes / 3
 	if freqHint < 4096 {
 		freqHint = 4096
@@ -593,110 +557,81 @@ func (e *Encoder) buildTokens(
 	}
 	frequency := newPairCounter(freqHint)
 	maxTokenLen := e.config.MaxTokenLen
+	nextTokenID := uint16(singleByteTokens)
 
-	// State machine variables
-	segIdx := 0
-	pos := 0
-	end := 0
-	prevTokenID := uint16(0)
-	prevLength := 0
-	hasPrev := false
+	var ctrl *thresholdController
+	if threshold == 0 {
+		ctrl = newThresholdController(int(limitTokenID)-(singleByteTokens-1), sampleBytes)
+		threshold = ctrl.threshold
+	}
 
-	// Single loop - advances through all segments and tokens
-	for {
-		// State: need to start a new segment
-		if !hasPrev {
-			// Find next non-empty segment
-			for segIdx < len(shuffledIndices) {
-				index := shuffledIndices[segIdx]
-				start := endPositions[index]
-				end = endPositions[index+1]
-				segIdx++
-
-				if start >= end {
-					continue
-				}
-
-				// Get first token of segment
-				tokenID, length, ok := matcher.find(data[start:end])
-				if !ok {
-					continue
-				}
-
-				prevTokenID = tokenID
-				prevLength = length
-				pos = start + length
-				hasPrev = true
-				break
-			}
-
-			// No more segments
-			if !hasPrev {
-				break
-			}
+	for _, index := range sampleIndices {
+		start := endPositions[index]
+		end := endPositions[index+1]
+		if start >= end {
 			continue
 		}
+		seg := data[start:end]
 
-		// State: at end of current segment
-		if pos >= end {
-			hasPrev = false
-			continue
-		}
-
-		// State: have previous token, get current token
-		currTokenID, currLength, ok := matcher.find(data[pos:end])
+		prevTokenID, prevLength, ok := matcher.find(seg)
 		if !ok {
-			hasPrev = false
 			continue
 		}
-
-		// Check max token length constraint
-		if maxTokenLen > 0 && prevLength+currLength > maxTokenLen {
-			prevTokenID = currTokenID
-			prevLength = currLength
-			pos += currLength
-			continue
+		if ctrl != nil {
+			ctrl.onBytesScanned(prevLength)
 		}
 
-		// Count pair and check for merge
-		pair := uint32(prevTokenID)<<16 | uint32(currTokenID)
-		cnt := frequency.incr(pair)
-
-		if cnt >= threshold {
-			if nextTokenID > limitTokenID {
-				return dictionary, tokenBoundaries
+		for pos := prevLength; pos < len(seg); {
+			currTokenID, currLength, ok := matcher.find(seg[pos:])
+			if !ok {
+				break
 			}
-			mergedToken := data[pos-prevLength : pos+currLength]
-			if !matcher.insert(mergedToken, nextTokenID) {
-				frequency.remove(pair)
-				prevTokenID = currTokenID
-				prevLength = currLength
+			if ctrl != nil {
+				ctrl.onBytesScanned(currLength)
+			}
+
+			if maxTokenLen > 0 && prevLength+currLength > maxTokenLen {
+				prevTokenID, prevLength = currTokenID, currLength
 				pos += currLength
 				continue
 			}
-			dictionary = append(dictionary, mergedToken...)
-			tokenBoundaries = append(tokenBoundaries, uint32(len(dictionary)))
 
-			frequency.remove(pair)
-			prevTokenID = nextTokenID
-			prevLength = len(mergedToken)
+			pair := uint32(prevTokenID)<<16 | uint32(currTokenID)
+			if frequency.incr(pair) >= threshold {
+				if nextTokenID > limitTokenID {
+					return dictionary, tokenBoundaries
+				}
+				mergedToken := seg[pos-prevLength : pos+currLength]
+				if matcher.insert(mergedToken, nextTokenID) {
+					dictionary = append(dictionary, mergedToken...)
+					tokenBoundaries = append(tokenBoundaries, uint32(len(dictionary)))
+					frequency.remove(pair)
+					prevTokenID, prevLength = nextTokenID, len(mergedToken)
+					pos += currLength
 
-			if nextTokenID == limitTokenID {
-				return dictionary, tokenBoundaries
+					if nextTokenID == limitTokenID {
+						return dictionary, tokenBoundaries
+					}
+					nextTokenID++
+					if ctrl != nil {
+						ctrl.onEntryCreated()
+						threshold = ctrl.threshold
+					}
+					continue
+				}
+				frequency.remove(pair)
 			}
-			nextTokenID++
-		} else {
-			prevTokenID = currTokenID
-			prevLength = currLength
+			prevTokenID, prevLength = currTokenID, currLength
+			pos += currLength
 		}
-		pos += currLength
 	}
 
 	return dictionary, tokenBoundaries
 }
 
-// compress parses the data using the trained matcher.
-func (e *Encoder) compress(data []byte, endPositions []int, matcher *Matcher) ([]uint16, []int) {
+// compress parses the data using the trained matcher, emitting sorted token
+// ids via remap (the matcher works in creation-order ids).
+func (e *Encoder) compress(data []byte, endPositions []int, matcher *matcher, remap []uint16) ([]uint16, []int) {
 	compressedData := make([]uint16, 0, len(data)/2)
 	stringBoundaries := make([]int, 0, len(endPositions))
 	stringBoundaries = append(stringBoundaries, 0)
@@ -717,7 +652,7 @@ func (e *Encoder) compress(data []byte, endPositions []int, matcher *Matcher) ([
 				// Should not happen if single byte tokens are present
 				break
 			}
-			compressedData = append(compressedData, tokenID)
+			compressedData = append(compressedData, remap[tokenID])
 			pos += length
 		}
 		stringBoundaries = append(stringBoundaries, len(compressedData))

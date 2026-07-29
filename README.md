@@ -108,6 +108,10 @@ if err != nil {
 fmt.Println(string(buf[:n]))
 ```
 
+`DecompressString` and `DecompressAllChecked` treat buffer bytes beyond the
+returned length as scratch space: the fast decode path may overwrite them
+(never past `len(buf)`). Use `buf[:n]` only.
+
 ### Bulk decode with error handling
 
 ```go
@@ -118,6 +122,26 @@ if err != nil {
 }
 _ = all[:n]
 ```
+
+### Compressed-domain search
+
+Equality, prefix, and substring queries run directly over the token streams,
+without decoding rows back to bytes. The dictionary is sorted at training
+time, so a `Searcher` validates once at construction and queries cannot fail
+on malformed data:
+
+```go
+s, err := archive.Searcher()
+if err != nil {
+    panic(err)
+}
+equal := s.RowsEqualTo([]byte("user_000002"))     // row indices exactly equal
+prefixed := s.RowsStartingWith([]byte("user_"))   // row indices with prefix
+containing, err := s.RowsContaining([]byte("_00")) // row indices with substring
+```
+
+Archives serialized by versions that predate dictionary sorting fail
+`Searcher()` with `ErrDictionaryNotSearchable`; re-encode them to search.
 
 ### Serialization
 
@@ -181,6 +205,14 @@ _ = out
 - `(*Archive).AppendAll(dst []byte) ([]byte, error)`
 - `(*Archive).DecompressString(index int, buffer []byte) (int, error)`
 - `(*Archive).DecompressAllChecked(buffer []byte) (int, error)`
+
+### Compressed-domain search
+
+- `(*Archive).Searcher() (*Searcher, error)`
+- `(*Searcher).Tokenize(text []byte) []uint16`
+- `(*Searcher).RowsEqualTo(needle []byte) []int`
+- `(*Searcher).RowsStartingWith(prefix []byte) []int`
+- `(*Searcher).RowsContaining(pattern []byte) ([]int, error)`
 
 ### Serialization
 
