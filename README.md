@@ -17,7 +17,7 @@ OnPair16 is a variant that limits dictionary entries to a maximum length of 16 b
 ## Installation
 
 ```bash
-go get github.com/seiflotfy/onpair
+go get github.com/axiomhq/onpair
 ```
 
 ## Quick Start
@@ -29,7 +29,7 @@ package main
 
 import (
     "fmt"
-    "github.com/seiflotfy/onpair"
+    "github.com/axiomhq/onpair"
 )
 
 func main() {
@@ -225,7 +225,7 @@ _ = out
 ## Building from Source
 
 ```bash
-git clone https://github.com/seiflotfy/onpair
+git clone https://github.com/axiomhq/onpair
 cd onpair
 
 # Run tests
